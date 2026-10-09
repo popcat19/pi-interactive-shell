@@ -48,4 +48,4 @@ npm test
 npm run typecheck
 ```
 
-Tests use synthetic `synthetic-only` values and local shell binaries. They do not contact network services, use sudo, or perform privileged operations. The lockfile pins the development dependency tree, including Pi SDK 0.87.1. Tests invoke system Python and JavaScript entry points, with no native npm executable requirement.
+Tests use synthetic `synthetic-only` values and local shell binaries. They do not contact network services, use sudo, or perform privileged operations. The lockfile pins the development dependency tree, including Pi SDK 0.87.1. `npm audit` reports one high-severity advisory group for `brace-expansion@5.0.9` pinned by that SDK's published shrinkwrap; `npm audit fix` and a root override did not replace it. This remains unresolved in the development SDK dependency tree. Tests invoke system Python and JavaScript entry points, with no native npm executable requirement.
