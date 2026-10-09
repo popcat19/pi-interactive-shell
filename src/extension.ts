@@ -14,8 +14,25 @@ export default function extension(pi: ExtensionAPI) {
   let busy = false;
   const pending = new Map<string, { task: ShellTask; generation: number; owner: TaskRegistry; ctx: ExtensionContext }>();
   const focused = new WeakMap<ShellTask, number>();
+  const completions = new Map<ShellTask, { owner: TaskRegistry; eligible: boolean; content?: string }>();
+  function deliverCompletions() {
+    if (busy) return;
+    for (const [task, delivery] of completions) {
+      if (delivery.owner !== registry) { completions.delete(task); continue; }
+      if (task.active || !delivery.eligible || delivery.content === undefined) continue;
+      // Mark before calling the void SDK API: retries could duplicate a persisted message.
+      completions.delete(task);
+      try { pi.sendMessage({
+        customType: "shell-completion",
+        content: delivery.content,
+        display: true,
+        details: undefined,
+      }, { triggerTurn: true, deliverAs: "followUp" }); } catch { /* No retry: the host may have accepted the message before throwing. */ }
+    }
+  }
   function drain() {
     if (busy) return;
+    deliverCompletions();
     for (const [id, item] of pending) {
       pending.delete(id);
       if (item.owner !== registry || registry.get(id) !== item.task || item.task.pendingPrompt()?.id !== item.generation || focused.get(item.task) === item.generation || !available(item.ctx) || logging()) continue;
@@ -86,7 +103,7 @@ export default function extension(pi: ExtensionAPI) {
       await cancellation;
     }
   }
-  async function run(command: string, timeout: number | undefined, background: boolean, ctx: ExtensionContext, signal?: AbortSignal) {
+  async function run(command: string, timeout: number | undefined, background: boolean, ctx: ExtensionContext, signal?: AbortSignal, local = false) {
     if (!available(ctx)) return statusResult("unavailable");
     if (logging()) return statusResult("logging-blocked");
     if (busy) return statusResult("busy");
@@ -117,11 +134,26 @@ export default function extension(pi: ExtensionAPI) {
         ctx.ui.notify(`Waiting for your input. Task ${waiting.id}. Program-provided request: ${prompt.text}. Run /shell-attach ${waiting.id}. Runtime timeout includes prompt wait.`, "warning");
       });
       if (!task) return statusResult("task-limit");
-      void task.done.then(() => ctx.ui.setStatus?.(`shell-${task!.id}`, undefined));
+      completions.set(task, { owner, eligible: background || local });
+      void task.done.then(() => {
+        const delivery = completions.get(task!);
+        if (delivery) delivery.content = `Shell task completed\n${JSON.stringify({ id: task!.id, status: task!.status, exitCode: task!.exitCode ?? null })}\nOutput:\n${task!.read()}`;
+        ctx.ui.setStatus?.(`shell-${task!.id}`, undefined);
+        deliverCompletions();
+      });
       if (!background) await focus(task, ctx, signal);
+      const delivery = completions.get(task);
+      if (delivery && !background && !local) {
+        if (["running", "waiting-for-user"].includes(task.status)) delivery.eligible = true;
+        else {
+          // Broker status arrives before child close; a terminal tool result owns delivery.
+          completions.delete(task);
+          await task.done;
+        }
+      }
       return result(JSON.stringify(task.summary()) + `\nOutput:\n${task.read()}`);
     } catch {
-      if (task) await task.stop();
+      if (task) { const delivery = completions.get(task); if (delivery) delivery.eligible = true; await task.stop(); }
       return statusResult("error");
     } finally { busy = false; drain(); }
   }
@@ -149,7 +181,7 @@ export default function extension(pi: ExtensionAPI) {
   });
   for (const [name, background] of [["shell", false], ["shell-bg", true]] as const) {
     pi.registerCommand(name, { description: `Approve ${background ? "background" : "foreground"} command`, handler: async (command, ctx) => {
-      const response = await run(command, undefined, background, ctx, ctx.signal);
+      const response = await run(command, undefined, background, ctx, ctx.signal, true);
       // Do not copy visible command output to notifications.
       const text = response.content[0].text;
       ctx.ui.notify(text.startsWith("{") ? text.split("\n")[0] : text, "info");
@@ -174,6 +206,7 @@ export default function extension(pi: ExtensionAPI) {
   } });
   pi.on("session_start", async () => {
     pending.clear();
+    completions.clear();
     closeActive?.();
     const previous = registry;
     registry = new TaskRegistry();
@@ -187,6 +220,7 @@ export default function extension(pi: ExtensionAPI) {
   });
   pi.on("session_shutdown", async () => {
     pending.clear();
+    completions.clear();
     closeActive?.();
     const old = registry;
     registry = new TaskRegistry();

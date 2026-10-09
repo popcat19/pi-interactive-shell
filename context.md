@@ -5,7 +5,7 @@
 - Domain: interactive shell input.
 - Bounded context: this standalone Pi package and Python PTY broker.
 - Infrastructure: `broker/pty-broker.py` owns Linux PTY lifecycle.
-- Policy: `src/extension.ts` owns local approval, serialized generation-checked prompt focus, and opt-in bash decisions.
+- Policy: `src/extension.ts` owns local approval, serialized generation-checked prompt focus, session-owned completion delivery, and opt-in bash decisions.
 - Aggregate root: `src/task-registry.ts` owns bounded in-memory session tasks, live prompt context, and broker lifetimes.
 - UI: `src/shell-screen.ts` owns provisional masking and transient TUI rendering.
 - Supporting domain: `tests/` validates broker and extension contracts with synthetic inputs.

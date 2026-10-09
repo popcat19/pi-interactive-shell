@@ -9,7 +9,9 @@ function fixture(enabled = false) {
   const handlers = new Map<string, () => void | Promise<void>>();
   const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
   const flags = new Map<string, string | boolean>();
+  const messages: { message: Parameters<ExtensionAPI["sendMessage"]>[0]; options: Parameters<ExtensionAPI["sendMessage"]>[1] }[] = [];
   const api = {
+    sendMessage(message: Parameters<ExtensionAPI["sendMessage"]>[0], options: Parameters<ExtensionAPI["sendMessage"]>[1]) { messages.push({ message, options }); },
     registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
     registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) { commands.set(name, command); },
     registerFlag(name: string, options: { default: string | boolean }) { flags.set(name, options.default); },
@@ -19,7 +21,7 @@ function fixture(enabled = false) {
   extension(api);
   flags.set("interactive-shell-bash", enabled);
   handlers.get("session_start")!();
-  return { tools, handlers, commands, flags };
+  return { tools, handlers, commands, flags, messages };
 }
 
 test("disabled integration registers no bash override", () => {
@@ -393,6 +395,160 @@ test("actual dispatcher retains interrupted input against editor and queued task
     assert.equal(sent.filter(m => JSON.stringify(m).includes('"type":"input"')).length, 1);
   } finally {
     await f.handlers.get("session_shutdown")!(); tui.stop(); TaskRegistry.prototype.start = originalStart;
+    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
+    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
+  }
+});
+
+test("completion messages publish once with follow-up turns for background, detached and local tasks", async () => {
+  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  const f = fixture();
+  let screen!: import("../src/shell-screen.ts").ShellScreen;
+  let mounts = 0;
+  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { notify() {}, setStatus() {}, custom: (factory: Function) => new Promise(resolve => {
+    screen = factory({ requestRender() {}, terminal: { columns: 100, rows: 40 } }, {}, {}, resolve); mounts++;
+  }) } } as unknown as ExtensionContext;
+  const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
+  const wait = async (condition: () => boolean) => { for (let i = 0; i < 300 && !condition(); i++) await pause(10); assert(condition()); };
+  const approve = () => { screen.render(100); screen.handleInput("y"); };
+  const tool = (command: string, background = false, timeout = 3) => f.tools.get("interactive_shell")!.execute("t", { command, background, timeout }, undefined, undefined, ctx);
+  const taskAction = (id: string, action: string) => f.tools.get("shell_task")!.execute("q", { id, action }, undefined, undefined, ctx);
+  const idOf = (r: Awaited<ReturnType<typeof tool>>) => JSON.parse((r.content[0] as { text: string }).text.split("\n")[0]).id;
+  try {
+    for (const [command, status, code] of [["printf synthetic-output", "completed", 0], ["printf synthetic-failure; exit 7", "failed", 7], ["printf synthetic-timeout; sleep 30", "timeout", null]] as const) {
+      const before = f.messages.length;
+      const run = tool(command, true, 1); approve(); const id = idOf(await run);
+      await wait(() => f.messages.length === before + 1);
+      const { message, options } = f.messages.at(-1)!;
+      assert.equal(message.customType, "shell-completion"); assert.equal(message.display, true); assert.equal(message.details, undefined);
+      assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" });
+      assert(String(message.content).includes(id)); assert(String(message.content).includes(`"status":"${status}"`));
+      assert(String(message.content).includes(`"exitCode":${code}`)); assert(String(message.content).includes("synthetic-"));
+      await taskAction(id, "read"); await taskAction(id, "status"); await taskAction(id, "stop");
+      assert.equal(f.messages.length, before + 1);
+    }
+    let before = f.messages.length;
+    let run = tool("printf synthetic-cancel; sleep 30", true); approve(); const cancelledId = idOf(await run);
+    await pause(100); await taskAction(cancelledId, "stop"); await wait(() => f.messages.length === before + 1);
+    assert(String(f.messages.at(-1)!.message.content).includes('"status":"cancelled"'));
+    before = f.messages.length;
+    const initialMount = mounts;
+    run = tool("printf synthetic-foreground"); approve(); await wait(() => mounts === initialMount + 2);
+    await wait(() => screen.render(100).join("\n").includes("completed"));
+    assert.equal(f.messages.length, before); screen.handleInput("\r");
+    assert(JSON.stringify(await run).includes("synthetic-foreground")); assert.equal(f.messages.length, before);
+    // Detach before completion: tool returns launch status, completion publishes later.
+    run = tool("sleep .2; printf synthetic-detached"); approve(); await pause(20); screen.handleInput("\x04"); await run;
+    await wait(() => f.messages.length === before + 1);
+    for (const name of ["shell", "shell-bg"]) {
+      before = f.messages.length;
+      const local = f.commands.get(name)!.handler("printf synthetic-local; exit 4", ctx); approve();
+      if (name === "shell") {
+        await wait(() => screen.render(100).join("\n").includes("failed"));
+        assert.equal(f.messages.length, before); screen.handleInput("\r");
+      }
+      await local; await wait(() => f.messages.length === before + 1);
+      assert(String(f.messages.at(-1)!.message.content).includes('"exitCode":4'));
+    }
+    // Completion while an auto-open response owns focus is withheld until acknowledgement.
+    before = f.messages.length;
+    run = tool("stty -echo; printf 'Password: '; sleep .5; exit 9", true); approve(); await run;
+    await wait(() => screen.render(100).join("\n").includes("Waiting for your input"));
+    screen.handleInput("synthetic-response");
+    await wait(() => screen.render(100).join("\n").includes("Input interrupted"));
+    await pause(150); assert.equal(f.messages.length, before);
+    screen.handleInput("\x04"); await wait(() => f.messages.length === before + 1);
+    assert(!String(f.messages.at(-1)!.message.content).includes("synthetic-response"));
+    assert(String(f.messages.at(-1)!.message.content).includes('"exitCode":9'));
+    // An unrelated approval also defers delivery; session replacement discards it.
+    before = f.messages.length;
+    run = tool("sleep .1; printf stale-output", true); approve(); await run;
+    const blocked = tool("true"); await pause(300);
+    assert.equal(f.messages.length, before);
+    await f.handlers.get("session_start")!(); await blocked; await pause(50);
+    assert.equal(f.messages.length, before);
+    run = tool("sleep 30", true); approve(); await run;
+    await f.handlers.get("session_shutdown")!(); await pause(50);
+    assert.equal(f.messages.length, before);
+  } finally {
+    await f.handlers.get("session_shutdown")!();
+    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
+    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
+  }
+});
+
+test("installed SDK custom completion API preserves role/display and requests idle or streaming follow-up", async () => {
+  const sdk = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js", import.meta.url).href);
+  const prompts: unknown[] = [], followUps: unknown[] = [], persisted: unknown[] = [];
+  const idle = {
+    isStreaming: false,
+    _isEmittingAgentSettled: false,
+    _runAgentPrompt: async (message: unknown) => { prompts.push(message); persisted.push(message); },
+  };
+  const message = { customType: "shell-completion", content: 'Task synthetic-id failed (exit 7)\nsynthetic-output', display: true, details: undefined };
+  await sdk.AgentSession.prototype.sendCustomMessage.call(idle, message, { triggerTurn: true, deliverAs: "followUp" });
+  assert.equal(prompts.length, 1); assert.equal(persisted.length, 1);
+  assert.equal((prompts[0] as { role: string }).role, "custom");
+  assert.equal((prompts[0] as { display: boolean }).display, true);
+  const streaming = { isStreaming: true, agent: { followUp(message: unknown) { followUps.push(message); }, steer() { assert.fail("completion must not steer"); } } };
+  await sdk.AgentSession.prototype.sendCustomMessage.call(streaming, message, { triggerTurn: true, deliverAs: "followUp" });
+  assert.equal(followUps.length, 1);
+  assert.equal((followUps[0] as { content: string }).content, message.content);
+});
+
+test("terminal broker frame before child close remains foreground-owned; deferred completions drain once", async () => {
+  const { TaskRegistry } = await import("../src/task-registry.ts");
+  type Task = import("../src/task-registry.ts").ShellTask;
+  const originalStart = TaskRegistry.prototype.start;
+  const tasks: Task[] = [];
+  TaskRegistry.prototype.start = function (...args) { const task = originalStart.apply(this, args); if (task) tasks.push(task); return task; };
+  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  const f = fixture();
+  let screen!: import("../src/shell-screen.ts").ShellScreen;
+  let mounts = 0;
+  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { notify() {}, setStatus() {}, custom: (factory: Function) => new Promise(resolve => {
+    screen = factory({ requestRender() {}, terminal: { columns: 100, rows: 40 } }, {}, {}, resolve); mounts++;
+  }) } } as unknown as ExtensionContext;
+  const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
+  const wait = async (condition: () => boolean) => { for (let i = 0; i < 300 && !condition(); i++) await pause(10); assert(condition()); };
+  const approve = () => { screen.render(100); screen.handleInput("y"); };
+  const execute = (command: string, background = false) => f.tools.get("interactive_shell")!.execute("t", { command, background }, undefined, undefined, ctx);
+  try {
+    let returned = false;
+    const foreground = execute("sleep .4").then(result => { returned = true; return result; });
+    approve(); await wait(() => mounts === 2);
+    const task = tasks[0];
+    (task as unknown as { receive(data: string): void }).receive('{"type":"output","text":"synthetic-final"}\n{"type":"done","status":"completed","exitCode":0}\n');
+    assert.equal(task.active, true); assert.equal(task.status, "completed");
+    screen.handleInput("\x04");
+    await pause(30); assert.equal(returned, false); assert.equal(f.messages.length, 0);
+    await task.done;
+    const result = await foreground;
+    assert(JSON.stringify(result).includes('synthetic-final'));
+    assert(JSON.stringify(result).includes('completed'));
+    assert.equal(f.messages.length, 0);
+    // Three finished tasks cannot release a screen or lose their per-task snapshots.
+    for (let n = 0; n < 3; n++) {
+      const background = execute(`sleep .3; printf synthetic-${n}`, true); approve(); await background;
+    }
+    const blocking = execute("true");
+    const heldScreen = screen;
+    await wait(() => tasks.slice(1).every(t => !t.active));
+    assert.equal(screen, heldScreen); assert.equal(f.messages.length, 0);
+    screen.handleInput("\x1b"); await blocking;
+    await wait(() => f.messages.length === 3);
+    for (let n = 0; n < 3; n++) {
+      const matching = f.messages.filter(m => String(m.message.content).includes(tasks[n + 1].id));
+      assert.equal(matching.length, 1);
+      assert(String(matching[0].message.content).includes(`synthetic-${n}`));
+      assert.deepEqual(matching[0].options, { triggerTurn: true, deliverAs: "followUp" });
+    }
+  } finally {
+    await f.handlers.get("session_shutdown")!(); TaskRegistry.prototype.start = originalStart;
     if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
     if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
   }

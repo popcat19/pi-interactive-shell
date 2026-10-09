@@ -79,3 +79,11 @@ npm run typecheck
 Tests use synthetic responses and local commands, with no privileged or network authentication. They cover visible output by default, command echo behavior, background prompt detection and timeout, masked input, task lifecycle, approval rendering, bounded layout/paging, and actual Pi TUI debug dispatch with a synthetic terminal. Physical-terminal appearance, screen-reader behavior, and key delivery still need manual validation.
 
 SDK dev dependencies remain pinned to 0.87.1. The existing unresolved `brace-expansion@5.0.9` advisory comes from its published shrinkwrap. This change does not alter dependencies or the lockfile, install itself, modify settings, or publish.
+
+## Completion in the conversation
+
+Background tasks, foreground tasks detached before completion, and local `/shell` or `/shell-bg` runs publish one displayed, model-visible `shell-completion` message with task ID, terminal status, exit code (null when unavailable), and the same last 16384 sanitized output characters. Success, nonzero exit, timeout, and explicit cancellation all report. The message requests an agent continuation through Pi's `triggerTurn: true` with `deliverAs: "followUp"`, not steering an in-flight response.
+
+Delivery waits while any shell approval/input screen owns focus, including an interrupted inert response. Dismiss or acknowledge that screen to release the completion; no screen mounted means completion publishes when the broker closes. No automatic focus dismissal was added. A foreground agent tool that returns a terminal result uses that result alone, without a duplicate completion message. Task read/status/stop calls do not create extra completion messages.
+
+Session replacement and shutdown discard pending reports and suppress cancellation continuations for the old session. Completion markers are in-memory and removed on delivery/reset. The void SDK send API provides no persistence acknowledgement; this extension makes one dispatch attempt and does not retry a failed host delivery, avoiding duplicate messages. Command-echoed credentials remain visible output; response buffers are never copied into completion messages or details.
