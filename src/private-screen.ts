@@ -11,6 +11,7 @@ export type ScreenActions = {
   manual(): void;
   submit(id: number, value: string): void;
   close(): void;
+  detach?(): void;
 };
 
 export class PrivateScreen {
@@ -18,6 +19,12 @@ export class PrivateScreen {
   private command: string;
   private page = 0;
   private pages = 1;
+  private previewRendered = false;
+  private previewWidth = 0;
+  private reviewed = new Set<number>();
+  private outputPage = 0;
+  private followOutput = true;
+  private identity = "SHELL: private";
   private output = "";
   private secret = "";
   private prompt?: { id: number; deadline: number };
@@ -26,7 +33,11 @@ export class PrivateScreen {
   private disposed = false;
   private actions: ScreenActions;
   private redraw: () => void;
-  constructor(command: string, actions: ScreenActions, redraw: () => void) {
+  private heading: string;
+  private currentWidth?: () => number;
+  constructor(command: string, actions: ScreenActions, redraw: () => void, heading = "PRIVATE SHELL: approve exact JSON-escaped command", currentWidth?: () => number) {
+    this.currentWidth = currentWidth;
+    this.heading = heading;
     this.actions = actions;
     this.redraw = redraw;
     this.command = escapedCommand(command);
@@ -35,7 +46,11 @@ export class PrivateScreen {
       this.redraw();
     }, 100);
   }
-  invalidate() {}
+  start(id = "local", policy: "private" | "visible" = "private") {
+    this.phase = "running"; this.command = ""; this.status = "Running";
+    this.identity = `Task ${id} | output: ${policy}` + (policy === "visible" ? "\nWARNING: echoed credentials reach the model and session transcript." : "\nOutput withheld unless selected and released locally.");
+  }
+  invalidate() { this.previewRendered = false; }
   invalidatePrompt() {
     this.secret = "";
     this.prompt = undefined;
@@ -64,6 +79,9 @@ export class PrivateScreen {
   }
   handleInput(data: string) {
     if (this.disposed || isKeyRelease(data)) return;
+    if (this.phase === "running" && matchesKey(data, "ctrl+d") && this.actions.detach) {
+      this.invalidatePrompt(); this.actions.detach(); return;
+    }
     if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
       this.secret = "";
       if (this.phase === "done") this.actions.close();
@@ -71,14 +89,20 @@ export class PrivateScreen {
       return;
     }
     if (this.phase === "approval") {
+      const previousPage = this.page;
       if (matchesKey(data, "right") || matchesKey(data, "pageDown") || data === " ") this.page = Math.min(this.pages - 1, this.page + 1);
       if (matchesKey(data, "left") || matchesKey(data, "pageUp")) this.page = Math.max(0, this.page - 1);
-      if (data === "y" && this.page === this.pages - 1) {
+      if (previousPage !== this.page) this.previewRendered = false;
+      if (data === "y" && this.previewRendered && (!this.currentWidth || this.currentWidth() === this.previewWidth) && this.reviewed.size === this.pages && this.page === this.pages - 1) {
         this.phase = "running";
         this.command = "";
         this.status = "Running privately";
         this.actions.approve();
       }
+    } else if (matchesKey(data, "pageUp") || matchesKey(data, "pageDown")) {
+      const count = Math.max(1, Math.ceil(this.output.length / 256));
+      this.outputPage = Math.max(0, Math.min(count - 1, this.outputPage + (matchesKey(data, "pageUp") ? -1 : 1)));
+      this.followOutput = this.outputPage === count - 1;
     } else if (this.phase === "done") {
       if (matchesKey(data, "enter")) this.actions.close();
     } else if (matchesKey(data, "ctrl+p")) {
@@ -104,15 +128,22 @@ export class PrivateScreen {
     const w = Math.max(1, width);
     let lines: string[];
     if (this.phase === "approval") {
+      if (this.previewWidth !== w) {
+        this.previewWidth = w; this.page = 0; this.reviewed.clear(); this.previewRendered = false;
+      }
       const commandLines = wrapTextWithAnsi(this.command, w);
       this.pages = Math.max(1, Math.ceil(commandLines.length / 8));
       this.page = Math.min(this.page, this.pages - 1);
-      lines = ["PRIVATE SHELL: approve exact JSON-escaped command", "bash --noprofile --norc -c <decoded command>", ...commandLines.slice(this.page * 8, this.page * 8 + 8), `Page ${this.page + 1}/${this.pages}. Left/right: review. y on last page: approve. Esc: deny.`, "Never put credentials in commands. Input is masked, not isolated."];
+      this.reviewed.add(this.page); this.previewRendered = true;
+      lines = [...wrapTextWithAnsi(this.heading, w), "JSON-escaped exact text:", ...commandLines.slice(this.page * 8, this.page * 8 + 8), `Page ${this.page + 1}/${this.pages}. Left/right: review. y on last page: approve. Esc: deny.`, "Never put credentials in commands. Input is masked, not isolated."];
     } else {
-      lines = ["PRIVATE SHELL: output never returned to the model", ...wrapTextWithAnsi(this.output, w).slice(-10), this.status];
+      const count = Math.max(1, Math.ceil(this.output.length / 256));
+      this.outputPage = this.followOutput ? count - 1 : Math.min(this.outputPage, count - 1);
+      const start = this.outputPage * 256, end = Math.min(this.output.length, start + 256);
+      lines = [...wrapTextWithAnsi(this.identity, w), ...wrapTextWithAnsi(`Retained offsets [${start}, ${end}) of ${this.output.length}. Page ${this.outputPage + 1}/${count}. PgUp/PgDn browse. Offsets shift as output arrives.`, w), ...wrapTextWithAnsi(escapedCommand(this.output.slice(start, end)), w), this.status];
       if (this.phase === "done") lines.push("Enter: close. Auto-close in 10 seconds.");
       else if (this.prompt) lines.push(`Response ${this.prompt.id}, lease ${Math.max(0, Math.ceil((this.prompt.deadline - performance.now()) / 1000))}s: ${"*".repeat(Math.min(60, Array.from(this.secret).length))}`, "Enter: send once. Ctrl+U: clear. Esc: cancel run.");
-      else lines.push("Ctrl+P: manually open masked response. Esc: cancel run.");
+      else lines.push("Ctrl+P: masked response. Ctrl+D: detach. Esc: stop.");
       lines.push("Program timers keep running. Prompt leases do not prove read readiness.");
     }
     return lines.map(line => truncateToWidth(line, w));

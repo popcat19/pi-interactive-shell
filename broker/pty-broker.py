@@ -138,17 +138,22 @@ class Broker:
     def run(self):
         import pty
 
-        self.pid, self.fd = pty.fork()
-        if self.pid == 0:
-            try:
-                os.chdir(self.config["cwd"])
-                os.environ["TERM"] = "dumb"
-                os.execvp("bash", ["bash", "--noprofile", "--norc", "-c", self.config["command"]])
-            except BaseException:
-                os._exit(127)
-        deadline = time.monotonic() + self.config["timeout"]
-        os.set_blocking(self.fd, False)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         try:
+            # Ownership must be assigned before a pending SIGTERM can raise SystemExit.
+            self.pid, self.fd = pty.fork()
+            if self.pid == 0:
+                try:
+                    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                    os.chdir(self.config["cwd"])
+                    os.environ["TERM"] = "dumb"
+                    os.execvp("bash", ["bash", "--noprofile", "--norc", "-c", self.config["command"]])
+                except BaseException:
+                    os._exit(127)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            deadline = time.monotonic() + self.config["timeout"]
+            os.set_blocking(self.fd, False)
             while True:
                 if not self.alive():
                     self.drain()
@@ -184,13 +189,18 @@ class Broker:
                             return
         finally:
             self.cleanup()
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def main():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     # Linux parent death interrupts the broker so its finally block kills the PTY group.
-    ctypes.CDLL(None).prctl(1, signal.SIGTERM)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    parent = os.getppid()
+    ctypes.CDLL(None).prctl(1, signal.SIGTERM)
+    # Close the race where Pi exits before the parent-death signal is armed.
+    if parent == 1 or os.getppid() != parent:
+        return
     broker = None
     try:
         line = b""
@@ -209,6 +219,8 @@ def main():
     except BaseException:
         pass
     finally:
+        if broker:
+            broker.cleanup()
         try:
             emit({"type": "done", "status": broker.status if broker else "error", "exitCode": broker.exit_code if broker else None})
         except BaseException:

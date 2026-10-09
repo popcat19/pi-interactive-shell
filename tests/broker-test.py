@@ -128,6 +128,77 @@ class BrokerTests(unittest.TestCase):
         c.event("invalidate")
         self.assertEqual(c.event("done")["status"], "completed")
 
+    def test_parent_exit_kills_ordinary_pty_child(self):
+        import sys
+        launcher = subprocess.Popen([sys.executable, "-c", '''
+import json, subprocess, sys
+p = subprocess.Popen([sys.executable, "-I", "-B", sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+p.stdin.write((json.dumps({"command": "printf '%s\\\\n' $$; sleep 30", "cwd": "/tmp", "timeout": 30, "lease": 1}) + "\\n").encode()); p.stdin.flush()
+while True:
+    event = json.loads(p.stdout.readline())
+    if event["type"] == "output":
+        print(event["text"].strip().replace("?", ""), flush=True)
+        break
+sys.stdin.readline()
+''', str(BROKER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertTrue(select.select([launcher.stdout], [], [], 3)[0])
+            pid = int(launcher.stdout.readline())
+            launcher.kill()
+            launcher.wait(timeout=3)
+            for _ in range(100):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("PTY child survived launcher exit")
+        finally:
+            if launcher.poll() is None:
+                launcher.kill()
+            launcher.wait(timeout=3)
+            for stream in (launcher.stdin, launcher.stdout, launcher.stderr):
+                stream.close()
+
+    def test_sigterm_during_fork_assignment_cleans_child(self):
+        import sys
+        script = r'''
+import importlib.util, os, pty, signal, sys
+spec = importlib.util.spec_from_file_location("broker", sys.argv[1])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+original = pty.fork
+child = None
+def interrupted_fork():
+    global child
+    pid, fd = original()
+    if pid:
+        child = pid
+        os.kill(os.getpid(), signal.SIGTERM)
+    return pid, fd
+pty.fork = interrupted_fork
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+broker = module.Broker({"command": "trap '' HUP; sleep 30", "cwd": "/tmp", "timeout": 30, "lease": 1})
+try:
+    broker.run()
+except SystemExit:
+    pass
+assert broker.cleaned and broker.pid == child
+try:
+    os.kill(child, 0)
+except ProcessLookupError:
+    pass
+else:
+    raise AssertionError("child survived interrupted ownership assignment")
+assert signal.SIGTERM not in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+'''
+        result = subprocess.run([sys.executable, "-c", script, str(BROKER)], capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_exec_child_does_not_inherit_blocked_sigterm(self):
+        c = self.client("kill -TERM $$; exit 42")
+        self.assertEqual(c.event("done")["exitCode"], -15)
+
     def test_malformed_input_fails_without_raw_error(self):
         c = self.client("sleep 10")
         c.process.stdin.write(b"not-json\n")
