@@ -3,18 +3,15 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-export type OutputPolicy = "private" | "visible";
 export type TaskEvent = { type: string; text?: string; id?: number; lease?: number };
 const terminal = new Set(["completed", "failed", "cancelled", "timeout", "error"]);
 const brokerPath = fileURLToPath(new URL("../broker/pty-broker.py", import.meta.url));
 export class ShellTask {
   readonly id = randomUUID();
-  readonly policy: OutputPolicy;
   status = "running";
   exitCode?: number;
   endedAt?: number;
   private output = "";
-  private released = "";
   private child?: ChildProcessWithoutNullStreams;
   private buffer = "";
   private listener?: (event: TaskEvent) => void;
@@ -23,10 +20,13 @@ export class ShellTask {
   private escalation?: ReturnType<typeof setTimeout>;
   private resolve!: () => void;
   readonly done: Promise<void>;
+  private onWaiting?: (task: ShellTask, waiting: boolean) => void;
+  private waitingHint = false;
+  private promptTimer?: ReturnType<typeof setTimeout>;
   private stopping = false;
   private closed = false;
-  constructor(command: string, cwd: string, timeout: number, lease: number, policy: OutputPolicy) {
-    this.policy = policy;
+  constructor(command: string, cwd: string, timeout: number, lease: number, onWaiting?: (task: ShellTask, waiting: boolean) => void) {
+    this.onWaiting = onWaiting;
     this.done = new Promise(resolve => { this.resolve = resolve; });
     try {
       const child = this.child = spawn("python3", ["-I", "-B", brokerPath], { cwd, stdio: "pipe" });
@@ -68,25 +68,40 @@ export class ShellTask {
         } else if (event.type === "prompt" && Number.isSafeInteger(event.id) && Number.isFinite(event.lease) && event.lease > 0 && event.lease <= 120) {
           this.prompt = { id: event.id, deadline: performance.now() + event.lease * 1000 };
           this.status = "waiting-for-user";
+          clearTimeout(this.promptTimer);
+          this.promptTimer = setTimeout(() => this.invalidate(), event.lease * 1000);
+          this.updateWaiting();
           this.listener?.({ type: "prompt", id: event.id, lease: event.lease });
         } else if (event.type === "invalidate" || event.type === "submitted") this.invalidate();
       } catch { this.stop("error"); return; }
     }
   }
+  private updateWaiting() {
+    const waiting = Boolean(this.active && !this.stopping && !this.listener && this.prompt && this.prompt.deadline > performance.now());
+    if (waiting === this.waitingHint) return;
+    this.waitingHint = waiting;
+    this.onWaiting?.(this, waiting);
+  }
   private invalidate() {
+    clearTimeout(this.promptTimer);
     this.prompt = undefined;
+    this.updateWaiting();
     if (this.status === "waiting-for-user") this.status = "running";
     this.listener?.({ type: "invalidate" });
   }
   attach(listener: (event: TaskEvent) => void) {
     if (this.listener) return false;
     this.listener = listener;
+    this.updateWaiting();
     listener({ type: "output", text: this.output });
     // Reconnect never extends an existing generation's lease.
     if (this.prompt && this.prompt.deadline > performance.now()) listener({ type: "prompt", id: this.prompt.id, lease: (this.prompt.deadline - performance.now()) / 1000 });
     return true;
   }
-  detach() { this.listener = undefined; }
+  detach() {
+    this.listener = undefined;
+    this.updateWaiting();
+  }
   manual() { if (this.active && !this.stopping && this.listener) this.send({ type: "manual" }); }
   submit(id: number, value: string) {
     const prompt = this.prompt;
@@ -114,14 +129,12 @@ export class ShellTask {
     this.escalation = setTimeout(() => this.child?.kill("SIGKILL"), 1500);
     return this.done;
   }
-  snapshot() { return this.output; }
-  release(selected: string) { this.released = (this.released + selected).slice(-4096); }
-  read() { return this.policy === "visible" ? this.output : this.released; }
+  read() { return this.output; }
   summary() {
     if (this.prompt && this.prompt.deadline <= performance.now()) this.invalidate();
-    return { id: this.id, status: this.status, policy: this.policy, exitCode: this.exitCode, attach: `/shell-attach ${this.id}` };
+    return { id: this.id, status: this.status, exitCode: this.exitCode, attach: `/shell-attach ${this.id}` };
   }
-  erase() { this.output = ""; this.released = ""; this.buffer = ""; this.detach(); }
+  erase() { this.output = ""; this.buffer = ""; this.detach(); }
 }
 export class TaskRegistry {
   private tasks = new Map<string, ShellTask>();
@@ -130,7 +143,7 @@ export class TaskRegistry {
   private prune() {
     for (const [id, task] of this.tasks) if (!task.active && Date.now() - task.endedAt! >= 600000) { task.erase(); this.tasks.delete(id); }
   }
-  start(command: string, cwd: string, timeout: number, lease: number, policy: OutputPolicy) {
+  start(command: string, cwd: string, timeout: number, lease: number, onWaiting?: (task: ShellTask, waiting: boolean) => void) {
     this.prune();
     if (this.closed || [...this.tasks.values()].filter(t => t.active).length >= 8) return undefined;
     if (this.tasks.size >= 16) {
@@ -139,7 +152,7 @@ export class TaskRegistry {
       oldest.erase(); this.tasks.delete(oldest.id);
     }
     this.timer ??= setInterval(() => this.prune(), 1000).unref();
-    const task = new ShellTask(command, cwd, timeout, lease, policy);
+    const task = new ShellTask(command, cwd, timeout, lease, onWaiting);
     this.tasks.set(task.id, task);
     return task;
   }

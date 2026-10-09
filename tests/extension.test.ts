@@ -19,7 +19,7 @@ function fixture(enabled = false) {
   extension(api);
   flags.set("interactive-shell-bash", enabled);
   handlers.get("session_start")!();
-  return { tools, handlers, commands };
+  return { tools, handlers, commands, flags };
 }
 
 test("disabled integration registers no bash override", () => {
@@ -31,11 +31,11 @@ test("opt-in integration replaces bash and never calls stock execute outside TUI
     let updates = 0;
     const result = await tools.get(name)!.execute("test", { command: "printf synthetic-output" }, undefined, () => { updates++; }, { mode: "rpc", hasUI: true } as ExtensionContext);
     assert.equal(updates, 0);
-    assert.deepEqual(result, { content: [{ type: "text", text: "Private shell status: unavailable. Output and responses withheld." }], details: undefined });
+    assert.deepEqual(result, { content: [{ type: "text", text: "Shell status: unavailable." }], details: undefined });
   }
 });
 
-test("approved background receipts, private leak boundaries, selected preview release, visible warning, and shutdown", async () => {
+test("background output is returned without policy choices; simplified commands and shutdown", async () => {
   const stdin = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
   const stdout = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
   Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
@@ -67,29 +67,13 @@ test("approved background receipts, private leak boundaries, selected preview re
     assert(!JSON.stringify(receipt).includes("synthetic-only"));
     const id = JSON.parse((receipt.content[0] as { text: string }).text.split("\n")[0]).id;
     await waitDone(id);
-    for (const action of ["list", "status", "read"]) assert(!(await query(id, action)).includes("synthetic-only"));
-    approve = false;
-    await f.commands.get("shell-release")!.handler(`${id} 0 14`, ctx);
-    assert(previews.at(-1)!.includes('"synthetic-only"'));
-    assert(!(await query(id)).includes("synthetic-only"));
-    approve = true;
-    await f.commands.get("shell-release")!.handler(`${id} 0 9`, ctx);
-    assert(previews.at(-1)!.includes('"synthetic"'));
-    assert((await query(id)).includes("synthetic"));
-    assert(!(await query(id)).includes("synthetic-only"));
-    assert(!(await query(id, "status")).includes("synthetic"));
-    approve = false;
-    const denied = await call("interactive_shell", { command: "printf synthetic-only", background: true, output: "visible" });
-    assert(JSON.stringify(denied).includes("denied"));
-    assert(previews.at(-1)!.includes("WARNING: programs can echo credentials"));
-    approve = true;
-    const visible = await call("interactive_shell", { command: "printf synthetic-only", background: true, output: "visible" });
-    const visibleId = JSON.parse((visible.content[0] as { text: string }).text.split("\n")[0]).id;
-    await waitDone(visibleId); assert((await query(visibleId)).includes("synthetic-only"));
+    for (const action of ["status", "read", "stop"]) assert((await query(id, action)).includes("synthetic-only"));
+    assert(!JSON.stringify(f.tools.get("interactive_shell")!.parameters).includes('"output"'));
+    assert.deepEqual([...f.commands.keys()].sort(), ["shell", "shell-attach", "shell-bg", "shell-stop", "shell-tasks"]);
+    assert(previews[0].includes("Echoed credentials are exposed"));
     assert.equal(updates, 0);
     await f.handlers.get("session_shutdown")!();
     assert((await query(id)).includes("not-found"));
-    assert((await query(visibleId)).includes("not-found"));
   } finally {
     await f.handlers.get("session_shutdown")!();
     if (stdin) Object.defineProperty(process.stdin, "isTTY", stdin); else Reflect.deleteProperty(process.stdin, "isTTY");
@@ -126,12 +110,12 @@ test("competing approvals fail busy; approval exceptions and session reset do no
   }
 });
 
-test("real Pi TUI input suppresses debug across approval, focus and release; cancel awaits cleanup", async () => {
+test("real Pi TUI input suppresses debug across approval and focus; cancel awaits cleanup", async () => {
   const { TuiMainScreen } = await import("@earendil-works/pi-tui");
   const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
   Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
   Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-  const f = fixture();
+  const f = fixture(true);
   let terminalInput!: (data: string) => void;
   const terminal = { columns: 1000, rows: 100, kittyProtocolActive: false,
     start(callback: (data: string) => void) { terminalInput = callback; }, stop() {}, async drainInput() {}, write() {}, moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
@@ -156,30 +140,47 @@ test("real Pi TUI input suppresses debug across approval, focus and release; can
   };
   tui.onDebug = debug;
   tui.start();
-  let screen: import("../src/private-screen.ts").PrivateScreen | undefined;
+  let screen: import("../src/shell-screen.ts").ShellScreen | undefined;
   let mount = 0;
-  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { notify() {}, custom: (factory: Function) => new Promise(resolve => {
+  const notices: string[] = [];
+  const statuses: string[] = [];
+  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { notify(text: string) { notices.push(text); }, setStatus(_key: string, text: string) { if (text) statuses.push(text); }, custom: (factory: Function) => new Promise(resolve => {
     screen = factory(tui, {}, {}, (value: unknown) => { tui.clear(); tui.setFocus(null); screen?.dispose(); resolve(value); });
     tui.addChild(screen!); tui.setFocus(screen!); mount++;
   }) } } as unknown as ExtensionContext;
   const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
   const wait = async (condition: () => boolean) => { for (let i = 0; i < 200 && !condition(); i++) await pause(10); assert(condition()); };
   const hitDebug = () => { const count = captures.length; terminalInput("\x1b[100;6u"); assert.equal(captures.length, count); };
-  const execute = (command: string, signal?: AbortSignal, background = false, policy = "private") => f.tools.get("interactive_shell")!.execute("t", { command, background, output: policy }, signal, undefined, ctx);
+  const execute = (command: string, signal?: AbortSignal, background = false) => f.tools.get("interactive_shell")!.execute("t", { command, background }, signal, undefined, ctx);
   const approve = () => { tui.render(1000); hitDebug(); terminalInput("y"); };
   const idOf = (r: Awaited<ReturnType<typeof execute>>) => JSON.parse((r.content[0] as { text: string }).text.split("\n")[0]).id;
   try {
     terminalInput("\x1b[100;6u"); assert.equal(captures.length, 1);
     let run = execute("printf '%s\\n' $$; sleep 30");
     approve(); await wait(() => mount === 2);
-    await wait(() => /"[0-9]+\?/.test(screen!.render(1000).join("\n")));
+    await wait(() => /[0-9]+\?/.test(screen!.render(1000).join("\n")));
     const rendered = screen!.render(1000).join("\n");
-    const pid = Number(rendered.match(/"([0-9]+)\?/)![1]);
+    const pid = Number(rendered.match(/([0-9]+)\?/)![1]);
     hitDebug(); terminalInput("\x1b");
     const cancelled = await run;
     assert(JSON.stringify(cancelled).includes("cancelled"));
     assert.throws(() => process.kill(pid, 0));
     assert.equal(tui.onDebug, debug);
+
+    for (const name of ["interactive_shell", "bash"]) {
+      const beforeOutput = mount;
+      const normal = f.tools.get(name)!.execute("o", { command: "printf synthetic-output" }, undefined, undefined, ctx);
+      approve(); await wait(() => mount === beforeOutput + 2);
+      await wait(() => screen!.render(1000).join("\n").includes("completed"));
+      terminalInput("\r");
+      assert(JSON.stringify(await normal).includes("synthetic-output"));
+    }
+    const local = f.commands.get("shell")!.handler("printf local-output", ctx);
+    const localMount = mount;
+    approve(); await wait(() => mount === localMount + 1);
+    await wait(() => screen!.render(1000).join("\n").includes("completed"));
+    assert(screen!.render(1000).join("\n").includes("local-output"));
+    terminalInput("\r"); await local;
 
     const controller = new AbortController();
     const before = mount;
@@ -190,21 +191,23 @@ test("real Pi TUI input suppresses debug across approval, focus and release; can
     run = execute(promptCommand); approve(); await wait(() => screen!.render(1000).join("\n").includes("Response "));
     hitDebug(); terminalInput("\x04"); const firstId = idOf(await run);
     assert.equal(tui.onDebug, debug);
-    run = execute(promptCommand, undefined, true, "visible"); approve(); const secondId = idOf(await run);
+    run = execute(promptCommand, undefined, true); approve(); const secondId = idOf(await run);
     await pause(250);
+    assert(notices.some(text => text.includes(secondId) && text.includes("Waiting for your input")));
+    assert(statuses.some(text => text.includes(secondId)));
     const listed = await f.tools.get("shell_task")!.execute("t", { action: "list" }, undefined, undefined, ctx);
     assert.equal((JSON.stringify(listed).match(/waiting-for-user/g) ?? []).length, 2);
-    for (const [id, policy] of [[firstId, "private"], [secondId, "visible"]]) {
+    for (const id of [firstId, secondId]) {
       const attached = f.commands.get("shell-attach")!.handler(id, ctx);
       const text = screen!.render(1000).join("\n");
-      assert(text.includes(id)); assert(text.includes(`output: ${policy}`));
-      if (policy === "visible") assert(text.includes("echoed credentials"));
+      assert(text.includes(id)); assert(text.includes("Waiting for your input"));
       hitDebug(); terminalInput("synthetic-only"); terminalInput("\r");
       await wait(() => screen!.render(1000).join("\n").includes("completed"));
       terminalInput("\r"); await attached; assert.equal(tui.onDebug, debug);
+      const read = await f.tools.get("shell_task")!.execute("r", { action: "read", id }, undefined, undefined, ctx);
+      assert(!JSON.stringify(read).includes("synthetic-only"));
+      assert(JSON.stringify(read).includes("Password:"));
     }
-    const release = f.commands.get("shell-release")!.handler(`${firstId} 0 9`, ctx);
-    assert(screen!.render(1000).join("\n").includes("RELEASE EXACT")); hitDebug(); terminalInput("\x1b"); await release;
     assert.equal(tui.onDebug, debug);
     assert.equal(captures.length, 1);
     assert.equal(readFileSync(getDebugLogPath(), "utf8"), captures[0]);
@@ -216,6 +219,36 @@ test("real Pi TUI input suppresses debug across approval, focus and release; can
     await f.handlers.get("session_shutdown")!(); tui.stop();
     if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
     rmSync(directory, { recursive: true, force: true });
+    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
+    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
+  }
+});
+
+test("repeated detached prompts notify once and clear persistent hints on expiry and output", async () => {
+  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  const f = fixture(); f.flags.set("interactive-shell-lease", "1");
+  const notices: string[] = [], changes: (string | undefined)[] = [];
+  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: {
+    notify(text: string) { notices.push(text); },
+    setStatus(_key: string, text: string | undefined) { changes.push(text); },
+    custom: (factory: Function) => new Promise(resolve => {
+      const screen = factory({ requestRender() {}, terminal: { columns: 1000, rows: 100 } }, {}, {}, resolve);
+      screen.render(1000); screen.handleInput("y");
+    }),
+  } } as unknown as ExtensionContext;
+  try {
+    const receipt = await f.tools.get("interactive_shell")!.execute("t", { command: "stty -echo; printf 'Password: '; sleep 1.5; printf 'Password: '; sleep .4; printf changed; sleep 2", background: true }, undefined, undefined, ctx);
+    const id = JSON.parse((receipt.content[0] as { text: string }).text.split("\n")[0]).id;
+    for (let i = 0; i < 150 && changes.length < 4; i++) await new Promise(r => setTimeout(r, 20));
+    assert.deepEqual(changes.slice(0, 4).map(Boolean), [true, false, true, false]);
+    assert.equal(notices.length, 1);
+    assert(notices[0].includes(id));
+    await f.tools.get("shell_task")!.execute("s", { action: "stop", id }, undefined, undefined, ctx);
+    assert.equal(changes.at(-1), undefined); assert.equal(notices.length, 1);
+  } finally {
+    await f.handlers.get("session_shutdown")!();
     if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
     if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
   }

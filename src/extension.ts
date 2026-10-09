@@ -1,34 +1,34 @@
-// Purpose: Gate session PTY tasks and output release behind local TUI approval.
+// Purpose: Gate session PTY tasks and masked input behind local TUI approval.
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { suppressDebug } from "./debug-guard.ts";
-import { PrivateScreen } from "./private-screen.ts";
-import { TaskRegistry, type ShellTask, type OutputPolicy } from "./task-registry.ts";
+import { ShellScreen } from "./shell-screen.ts";
+import { TaskRegistry, type ShellTask } from "./task-registry.ts";
 
 const LOGGING = ["PI_TUI_WRITE_LOG", "PI_TUI_DEBUG", "PI_TUI_DEBUG_REDRAW"];
 const result = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
-const statusResult = (status: string) => result(`Private shell status: ${status}. Output and responses withheld.`);
+const statusResult = (status: string) => result(`Shell status: ${status}.`);
 export default function extension(pi: ExtensionAPI) {
   let registry = new TaskRegistry();
   let busy = false;
   let closeActive: (() => void) | undefined;
-  pi.registerFlag("interactive-shell-bash", { type: "boolean", default: false, description: "Require approval and privately broker ALL agent bash calls" });
+  pi.registerFlag("interactive-shell-bash", { type: "boolean", default: false, description: "Require approval and broker ALL agent bash calls" });
   pi.registerFlag("interactive-shell-timeout", { type: "string", default: "300", description: "Task deadline in seconds, 1..3600" });
   pi.registerFlag("interactive-shell-lease", { type: "string", default: "30", description: "Masked prompt lease in seconds, 1..120" });
   const available = (ctx: ExtensionContext) => ctx.mode === "tui" && ctx.hasUI && process.stdin.isTTY && process.stdout.isTTY && process.platform === "linux";
   const logging = () => LOGGING.some(key => Boolean(process.env[key]));
   async function approve(text: string, heading: string, ctx: ExtensionContext, signal?: AbortSignal) {
     let restoreDebug: (() => void) | undefined;
-    let screen: PrivateScreen | undefined;
+    let screen: ShellScreen | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let cancel: (() => void) | undefined;
     try {
-      return await ctx.ui.custom<boolean>((tui, _theme, _keys, done) => {
+      return await ctx.ui.custom<boolean>((tui, theme, _keys, done) => {
         restoreDebug = suppressDebug(tui);
         cancel = () => done(false);
         closeActive = cancel;
-        screen = new PrivateScreen(text, { approve: () => done(!signal?.aborted && !logging()), cancel, close: cancel, manual() {}, submit() {} }, () => tui.requestRender(), heading, () => tui.terminal?.columns ?? 0);
+        screen = new ShellScreen(text, { approve: () => done(!signal?.aborted && !logging()), cancel, close: cancel, manual() {}, submit() {} }, () => tui.requestRender(), heading, () => tui.terminal?.columns ?? 0, () => tui.terminal?.rows ?? 24, (role, text) => theme.fg?.(role, text) ?? text);
         timer = setTimeout(cancel, 60000);
         signal?.addEventListener("abort", cancel, { once: true });
         if (signal?.aborted) queueMicrotask(cancel);
@@ -41,17 +41,17 @@ export default function extension(pi: ExtensionAPI) {
   }
   async function focus(task: ShellTask, ctx: ExtensionContext, signal?: AbortSignal) {
     let restoreDebug: (() => void) | undefined;
-    let screen: PrivateScreen | undefined;
+    let screen: ShellScreen | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let cancellation: Promise<void> | undefined;
     const cancel = () => { cancellation ??= task.stop(); closeActive?.(); };
     signal?.addEventListener("abort", cancel, { once: true });
     try {
-      await ctx.ui.custom<void>((tui, _theme, _keys, done) => {
+      await ctx.ui.custom<void>((tui, theme, _keys, done) => {
         restoreDebug = suppressDebug(tui);
         closeActive = () => done();
-        screen = new PrivateScreen("", { approve() {}, cancel, close: done, detach: done, manual: () => task.manual(), submit: (id, value) => task.submit(id, value) }, () => tui.requestRender());
-        screen.start(task.id, task.policy);
+        screen = new ShellScreen("", { approve() {}, cancel, close: done, detach: done, manual: () => task.manual(), submit: (id, value) => task.submit(id, value) }, () => tui.requestRender(), "", () => tui.terminal?.columns ?? 80, () => tui.terminal?.rows ?? 24, (role, text) => theme.fg?.(role, text) ?? text);
+        screen.start(task.id);
         const finish = () => { screen?.finish(task.status); timer ??= setTimeout(done, 10000); };
         task.attach(event => { if (event.type === "done") finish(); else screen?.event(event); });
         if (!task.active) finish();
@@ -64,27 +64,34 @@ export default function extension(pi: ExtensionAPI) {
       await cancellation;
     }
   }
-  async function run(command: string, timeout: number | undefined, background: boolean, policy: OutputPolicy, ctx: ExtensionContext, signal?: AbortSignal) {
+  async function run(command: string, timeout: number | undefined, background: boolean, ctx: ExtensionContext, signal?: AbortSignal) {
     if (!available(ctx)) return statusResult("unavailable");
     if (logging()) return statusResult("logging-blocked");
     if (busy) return statusResult("busy");
     const seconds = timeout ?? Number(pi.getFlag("interactive-shell-timeout"));
     const lease = Number(pi.getFlag("interactive-shell-lease"));
-    if (typeof command !== "string" || !command || command.length > 8192 || command.includes("\0") || !Number.isFinite(seconds) || seconds < 1 || seconds > 3600 || !Number.isFinite(lease) || lease < 1 || lease > 120 || !["private", "visible"].includes(policy)) return statusResult("invalid-request");
+    if (typeof command !== "string" || !command || command.length > 8192 || command.includes("\0") || !Number.isFinite(seconds) || seconds < 1 || seconds > 3600 || !Number.isFinite(lease) || lease < 1 || lease > 120) return statusResult("invalid-request");
     if (signal?.aborted) return statusResult("cancelled");
     busy = true;
     const owner = registry;
     let task: ShellTask | undefined;
     try {
-      const heading = policy === "visible"
-        ? "OUTPUT-VISIBLE APPROVAL: exact bash command below. WARNING: programs can echo credentials, including masked responses. ALL captured output can reach the model and session transcript. y approves this sharing policy."
-        : "PRIVATE APPROVAL: exact bash command below. Output stays private unless selected and released locally.";
+      const heading = "Warning: command output reaches the model and transcript. Echoed credentials are exposed; no secret redaction.";
       if (!await approve(command, `${heading} ${background ? "Background session task" : "Foreground task"}; deadline ${seconds}s. No durable services.`, ctx, signal)) return statusResult("denied");
       if (signal?.aborted || registry !== owner || logging()) return statusResult("cancelled");
-      task = owner.start(command, ctx.cwd, seconds, lease, policy);
+      let notified = false;
+      task = owner.start(command, ctx.cwd, seconds, lease, (waiting, needsInput) => {
+        if (!needsInput) { ctx.ui.setStatus?.(`shell-${waiting.id}`, undefined); return; }
+        if (owner !== registry) return;
+        ctx.ui.setStatus?.(`shell-${waiting.id}`, `Waiting for your input: /shell-attach ${waiting.id}`);
+        if (notified) return;
+        notified = true;
+        ctx.ui.notify(`Waiting for your input. Task ${waiting.id}. Run /shell-attach ${waiting.id}. Runtime timeout includes prompt wait.`, "warning");
+      });
       if (!task) return statusResult("task-limit");
+      void task.done.then(() => ctx.ui.setStatus?.(`shell-${task!.id}`, undefined));
       if (!background) await focus(task, ctx, signal);
-      return result(JSON.stringify(task.summary()) + (policy === "visible" ? `\nApproved output:\n${task.read()}` : "\nOutput and responses withheld. Use shell_task to query status."));
+      return result(JSON.stringify(task.summary()) + `\nOutput:\n${task.read()}`);
     } catch {
       if (task) await task.stop();
       return statusResult("error");
@@ -94,14 +101,13 @@ export default function extension(pi: ExtensionAPI) {
     command: Type.String({ description: "Exact bash command. Never include credentials." }),
     timeout: Type.Optional(Type.Number({ minimum: 1, maximum: 3600 })),
     background: Type.Optional(Type.Boolean({ description: "Return task receipt immediately after approval; never auto-focus prompts." })),
-    output: Type.Optional(Type.Union([Type.Literal("private"), Type.Literal("visible")], { description: "Private by default. Visible requires separate explicit echo-risk approval before execution." })),
   });
   pi.registerTool({
-    name: "interactive_shell", label: "Session shell", description: "Run exact command with local approval and masked TUI responses. Private by default. Background jobs return IDs; waiting-for-user requires local /shell-attach ID. Never request secrets in chat. No durable services.", parameters,
-    execute: async (_id, args, signal, _update, ctx) => run(args.command, args.timeout, args.background ?? false, args.output ?? "private", ctx, signal),
+    name: "interactive_shell", label: "Session shell", description: "Run exact command with local approval and masked TUI responses. Bounded output is returned. Background jobs return IDs; waiting-for-user requires local /shell-attach ID. Never request secrets in chat. No durable services.", parameters,
+    execute: async (_id, args, signal, _update, ctx) => run(args.command, args.timeout, args.background ?? false, ctx, signal),
   });
   pi.registerTool({
-    name: "shell_task", label: "Shell task", description: "List, query, read policy-approved bounded output, or stop session-owned tasks. Cannot attach, enter secrets, release private output, or change sharing policy.",
+    name: "shell_task", label: "Shell task", description: "List, query, read bounded output, or stop session-owned tasks. Input requires local /shell-attach; never request secrets in chat.",
     parameters: Type.Object({ action: Type.Union([Type.Literal("list"), Type.Literal("status"), Type.Literal("read"), Type.Literal("stop")]), id: Type.Optional(Type.String()) }),
     execute: async (_id, args) => {
       try {
@@ -109,13 +115,13 @@ export default function extension(pi: ExtensionAPI) {
         const task = registry.get(args.id ?? "");
         if (!task) return statusResult("not-found");
         if (args.action === "stop") await task.stop();
-        return result(JSON.stringify(task.summary()) + (args.action === "read" ? `\nApproved output:\n${task.read()}` : ""));
+        return result(JSON.stringify(task.summary()) + `\nOutput:\n${task.read()}`);
       } catch { return statusResult("error"); }
     },
   });
-  for (const [name, background, policy] of [["shell", false, "private"], ["shell-bg", true, "private"], ["shell-visible", false, "visible"], ["shell-bg-visible", true, "visible"]] as const) {
-    pi.registerCommand(name, { description: `Approve ${policy} ${background ? "background" : "foreground"} command`, handler: async (command, ctx) => {
-      const response = await run(command, undefined, background, policy, ctx, ctx.signal);
+  for (const [name, background] of [["shell", false], ["shell-bg", true]] as const) {
+    pi.registerCommand(name, { description: `Approve ${background ? "background" : "foreground"} command`, handler: async (command, ctx) => {
+      const response = await run(command, undefined, background, ctx, ctx.signal);
       // Do not copy visible command output to notifications.
       const text = response.content[0].text;
       ctx.ui.notify(text.startsWith("{") ? text.split("\n")[0] : text, "info");
@@ -135,27 +141,8 @@ export default function extension(pi: ExtensionAPI) {
     const task = registry.get(id.trim());
     if (!task) { ctx.ui.notify("Shell task not found", "info"); return; }
     busy = true;
+    ctx.ui.setStatus?.(`shell-${task.id}`, undefined);
     try { await focus(task, ctx); } catch { ctx.ui.notify("Shell screen unavailable", "error"); } finally { busy = false; }
-  } });
-  pi.registerCommand("shell-release", { description: "Release selected private output: ID START END (character offsets, max 4096); preview first", handler: async (args, ctx) => {
-    if (!available(ctx) || logging() || busy) return;
-    const [id, startText, endText, extra] = args.trim().split(/\s+/);
-    const task = registry.get(id);
-    if (!task || task.policy !== "private") return;
-    const snapshot = task.snapshot();
-    const start = Number(startText), end = Number(endText);
-    if (extra || !/^\d+$/.test(startText ?? "") || !/^\d+$/.test(endText ?? "") || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start || end > snapshot.length || end - start > 4096) {
-      ctx.ui.notify(`Use /shell-release ID START END. Current retained output: ${snapshot.length} characters; end exclusive, max 4096. Inspect via /shell-attach ID.`, "info"); return;
-    }
-    const selected = snapshot.slice(start, end);
-    busy = true;
-    const owner = registry;
-    try {
-      if (await approve(selected, "RELEASE EXACT SELECTED OUTPUT to model and session transcript. JSON-escaped preview below; no other output is released. Esc denies.", ctx) && owner === registry && owner.get(id) === task && !logging()) {
-        task.release(selected);
-        ctx.ui.notify("Selected output approved. shell_task read can retrieve it.", "info");
-      }
-    } catch { ctx.ui.notify("Output release cancelled", "info"); } finally { busy = false; }
   } });
   pi.on("session_start", async () => {
     closeActive?.();
@@ -164,8 +151,8 @@ export default function extension(pi: ExtensionAPI) {
     const cleanup = previous.shutdown();
     if (pi.getFlag("interactive-shell-bash") === true) {
       const original = createBashTool(process.cwd());
-      pi.registerTool({ name: "bash", label: "Private bash", description: "All bash calls require local TUI approval; private output and masked responses. Never put credentials in arguments.", parameters: original.parameters,
-        execute: async (_id, args, signal, _update, ctx) => run(args.command, args.timeout, false, "private", ctx, signal) });
+      pi.registerTool({ name: "bash", label: "Interactive bash", description: "All bash calls require local TUI approval; bounded output and masked responses. Never put credentials in arguments.", parameters: original.parameters,
+        execute: async (_id, args, signal, _update, ctx) => run(args.command, args.timeout, false, ctx, signal) });
     }
     await cleanup;
   });

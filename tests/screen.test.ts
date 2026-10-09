@@ -2,12 +2,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { PrivateScreen, escapedCommand } from "../src/private-screen.ts";
+import { ShellScreen, escapedCommand } from "../src/shell-screen.ts";
 
 function fixture() {
   const submitted: [number, string][] = [];
   let approvals = 0;
-  const screen = new PrivateScreen("printf 'hello'", {
+  const screen = new ShellScreen("printf 'hello'", {
     approve() { approvals++; }, cancel() {}, manual() {}, close() {},
     submit(id, value) { submitted.push([id, value]); },
   }, () => {});
@@ -54,14 +54,14 @@ test("output, expiry, process completion discard provisional text", async () => 
 });
 test("approval paging cannot accept before last page", () => {
   let approved = false;
-  const screen = new PrivateScreen("x".repeat(1000), { approve() { approved = true; }, cancel() {}, manual() {}, submit() {}, close() {} }, () => {});
+  const screen = new ShellScreen("x".repeat(1000), { approve() { approved = true; }, cancel() {}, manual() {}, submit() {}, close() {} }, () => {});
   try { screen.render(20); screen.handleInput("y"); assert.equal(approved, false); }
   finally { screen.dispose(); }
 });
 
 test("detach discards masked input without cancelling; disposed screen rejects stale reply", () => {
   let detached = 0, cancelled = 0, submitted = 0;
-  const screen = new PrivateScreen("", { approve() {}, cancel() { cancelled++; }, close() {}, manual() {}, submit() { submitted++; }, detach() { detached++; } }, () => {});
+  const screen = new ShellScreen("", { approve() {}, cancel() { cancelled++; }, close() {}, manual() {}, submit() { submitted++; }, detach() { detached++; } }, () => {});
   screen.start();
   screen.event({ type: "prompt", id: 1, lease: 10 });
   screen.handleInput("synthetic-only");
@@ -75,7 +75,7 @@ test("detach discards masked input without cancelling; disposed screen rejects s
 
 test("approval requires rendered pages, including after navigation and resize", () => {
   let approved = 0;
-  const screen = new PrivateScreen("x".repeat(200), { approve() { approved++; }, cancel() {}, manual() {}, submit() {}, close() {} }, () => {});
+  const screen = new ShellScreen("x".repeat(200), { approve() { approved++; }, cancel() {}, manual() {}, submit() {}, close() {} }, () => {});
   try {
     screen.handleInput("y"); assert.equal(approved, 0);
     screen.render(20);
@@ -83,22 +83,25 @@ test("approval requires rendered pages, including after navigation and resize", 
     screen.render(20);
     screen.invalidate(); screen.handleInput("y"); assert.equal(approved, 0);
     screen.render(10); screen.handleInput("y"); assert.equal(approved, 0);
-    for (let i = 0; i < 4; i++) { screen.handleInput("\x1b[C"); screen.render(10); }
+    for (let i = 0; i < 100; i++) { screen.handleInput("\x1b[C"); screen.render(10); }
     screen.handleInput("y"); assert.equal(approved, 1);
   } finally { screen.dispose(); }
 });
 
-test("attached output shows identity, policy, echo warning, and inspectable offset pages", () => {
+test("output is readable multiline, browsable, height bounded and actionable", () => {
   const f = fixture();
   try {
-    f.screen.start("synthetic-task", "visible");
-    f.screen.event({ type: "output", text: "old-synthetic" + "x".repeat(600) + "new-synthetic" });
-    const last = f.screen.render(80).join("\n");
-    assert(last.includes("synthetic-task")); assert(last.includes("output: visible"));
-    assert(last.includes("echoed credentials")); assert(last.includes("new-synthetic"));
-    f.screen.handleInput("\x1b[5~"); f.screen.handleInput("\x1b[5~");
-    const first = f.screen.render(80).join("\n");
-    assert(first.includes("[0, 256)")); assert(first.includes("old-synthetic"));
+    f.screen.start("synthetic-task");
+    f.screen.event({ type: "output", text: Array.from({length: 60}, (_, i) => `line-${i}`).join("\n") });
+    assert(f.screen.render(80).join("\n").includes("line-59"));
+    for (let i = 0; i < 100; i++) f.screen.handleInput("\x1b[5~");
+    assert(f.screen.render(80).join("\n").includes("line-0\nline-1"));
+    f.screen.event({ type: "prompt", id: 1, lease: 10 });
+    for (const width of [1, 10, 40, 80]) {
+      const lines = f.screen.render(width);
+      assert(lines.length <= 22); assert(lines.every(l => visibleWidth(l) <= width));
+    }
+    assert(f.screen.render(40).join("\n").includes("Waiting for your input"));
   } finally { f.screen.dispose(); }
 });
 
@@ -115,9 +118,23 @@ test("debug guard restores once and preserves a replacement callback", async () 
 
 test("terminal resize rejects approval until a new width preview renders", () => {
   let width = 80, approved = false;
-  const screen = new PrivateScreen("synthetic-only", { approve() { approved = true; }, cancel() {}, close() {}, manual() {}, submit() {} }, () => {}, "Review", () => width);
+  const screen = new ShellScreen("synthetic-only", { approve() { approved = true; }, cancel() {}, close() {}, manual() {}, submit() {} }, () => {}, "Review", () => width);
   try {
     screen.render(80); width = 40; screen.handleInput("y"); assert.equal(approved, false);
     screen.render(40); screen.handleInput("y"); assert.equal(approved, true);
+  } finally { screen.dispose(); }
+});
+
+test("approval defaults deny and short terminals fail closed within height", () => {
+  let denied = 0, approved = 0, height = 6;
+  const screen = new ShellScreen("printf synthetic-only", { approve() { approved++; }, cancel() { denied++; }, close() {}, manual() {}, submit() {} }, () => {}, "Echo warning", undefined, () => height);
+  try {
+    for (const width of [1, 20, 40, 80]) {
+      assert(screen.render(width).length <= height - 2);
+      screen.handleInput("y"); assert.equal(approved, 0);
+    }
+    height = 24;
+    assert(screen.render(80).join("\n").includes(":: Run this command? [y/N]"));
+    screen.handleInput("\r"); assert.equal(denied, 1); assert.equal(approved, 0);
   } finally { screen.dispose(); }
 });
