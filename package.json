@@ -1,0 +1,19 @@
+{
+  "name": "pi-interactive-shell",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Approval-gated private Linux PTY prompts for Pi",
+  "keywords": ["pi-package"],
+  "pi": { "extensions": ["./src/extension.ts"] },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": { "@types/node": "^22", "typescript": "^5.9.3" },
+  "scripts": {
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
+    "test": "python3 -B tests/broker-test.py && node --experimental-strip-types --test tests/*.test.ts"
+  }
+}
