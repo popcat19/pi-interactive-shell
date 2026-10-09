@@ -85,7 +85,10 @@ export default function extension(pi: ExtensionAPI) {
                   buffer = buffer.slice(newline + 1);
                   try {
                     const event = JSON.parse(line);
-                    if (event.type === "done") status = STATUSES.has(event.status) ? event.status : "error";
+                    if (event.type === "done") {
+                      status = STATUSES.has(event.status) ? event.status : "error";
+                      if (Number.isInteger(event.exitCode) && event.exitCode >= -64 && event.exitCode <= 255) status += ` (exit ${event.exitCode})`;
+                    }
                     else screen?.event(event);
                   } catch { cancel(); return; }
                 }

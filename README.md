@@ -9,7 +9,7 @@ cd /home/popcat19/pi-interactive-shell
 PI_CODING_AGENT_DIR=/tmp/pi-interactive-shell-settings pi --no-session --no-extensions -e ./src/extension.ts
 ```
 
-Use `/shell COMMAND`. Pi must be in its interactive Linux TUI with TTY stdin and stdout. The exact command is shown as JSON-escaped text before approval. `interactive_shell` is available to the model and returns status only. Output and responses are displayed only inside a transient custom TUI screen and are never sent in tool results, session messages, logs, argv, env, or temp files.
+Use `/shell COMMAND`. Pi must be in its interactive Linux TUI with TTY stdin and stdout. The exact command is shown as JSON-escaped text before approval. `interactive_shell` is available to the model and returns status only. The extension displays output only inside a transient custom TUI screen, masks responses, and does not deliberately copy either into tool results, session messages, logs, argv, env, or temp files. Results include a coarse status and, when available, the command exit code; negative codes indicate signal termination. External recording and command behavior remain outside this guarantee.
 
 Enable the existing agent bash integration only per launch:
 
@@ -36,13 +36,16 @@ A broker lease is not a program deadline. Linux provides no universal way to ide
 
 Masked input is provisional UI masking. It does not isolate secrets from the command, another extension, the terminal emulator, terminal scrollback, process memory, command-written files, or external recording. Output removal is best effort and does not erase terminal scrollback or external captures. Known Pi TUI debug logging is rejected when the extension can inspect its environment; logging configured outside those variables is not detectable.
 
-No credentials are created, cached, forced through askpass, or passed to privileged operations. Do not include credentials in commands or responses. Authentication, sudo/doas, systemd, SSH, and SFTP are outside scope.
+The extension does not create or cache credentials or force askpass. Responses entered in the private masked screen are passed to the approved command through its PTY, including authentication responses. Never put credentials in command arguments or chat. Terminal-based authentication is the intended use; actual sudo/doas, systemd, SSH, and SFTP integrations have not been validated. GUI polkit dialogs and full-screen terminal applications are not supported.
 
 ## Tests
 
+Requires Node.js 22.6+ with TypeScript stripping, npm, Python 3, and bash. Install the pinned development SDK dependencies before testing:
+
 ```sh
+npm ci --ignore-scripts
 npm test
 npm run typecheck
 ```
 
-Tests use synthetic `synthetic-only` values and local shell binaries. They do not contact network services, use sudo, or perform privileged operations. `npm` is not required for the checks above; scripts invoke system Python and the repository's checked TypeScript compiler path during development.
+Tests use synthetic `synthetic-only` values and local shell binaries. They do not contact network services, use sudo, or perform privileged operations. The lockfile pins the development dependency tree, including Pi SDK 0.87.1. Tests invoke system Python and JavaScript entry points, with no native npm executable requirement.

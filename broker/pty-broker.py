@@ -29,6 +29,8 @@ class Broker:
         self.pid = None
         self.fd = None
         self.status = "error"
+        self.exit_code = None
+        self.cleaned = False
         self.active = None
         self.serial = 0
         self.tail = ""
@@ -49,7 +51,8 @@ class Broker:
     def alive(self):
         pid, status = os.waitpid(self.pid, os.WNOHANG)
         if pid:
-            self.status = "completed" if os.waitstatus_to_exitcode(status) == 0 else "failed"
+            self.exit_code = os.waitstatus_to_exitcode(status)
+            self.status = "completed" if self.exit_code == 0 else "failed"
             return False
         return True
 
@@ -107,7 +110,15 @@ class Broker:
         return True
 
     def cleanup(self):
-        self.invalidate()
+        if self.cleaned:
+            return
+        self.cleaned = True
+        # A second termination must not interrupt escalation and reaping.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            self.invalidate()
+        except (BrokenPipeError, OSError):
+            pass
         if self.pid:
             # A new session/process group catches ordinary shell grandchildren.
             for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -199,7 +210,7 @@ def main():
         pass
     finally:
         try:
-            emit({"type": "done", "status": broker.status if broker else "error"})
+            emit({"type": "done", "status": broker.status if broker else "error", "exitCode": broker.exit_code if broker else None})
         except BaseException:
             pass
 

@@ -60,6 +60,22 @@ class BrokerTests(unittest.TestCase):
         c.send({"type": "input", "id": second["id"], "value": "synthetic-only"})
         self.assertEqual(c.event("done")["status"], "completed")
 
+    def test_exit_codes(self):
+        for command, code in [("exit 0", 0), ("exit 42", 42), ("kill -TERM $$", -15)]:
+            with self.subTest(command=command):
+                c = self.client(command)
+                self.assertEqual(c.event("done")["exitCode"], code)
+
+    def test_closed_output_pipe_still_cleans_child(self):
+        c = self.client("printf '%s\\n' $$; sleep 30")
+        output = c.event("output")["text"]
+        pid = int(output.strip().replace("?", ""))
+        c.process.stdout.close()
+        c.process.terminate()
+        c.process.wait(timeout=3)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
     def test_expired_lease_drops_input(self):
         c = self.client("stty -echo; printf 'Password: '; IFS= read -r -t 1 x; test -z \"$x\"", lease=0.2)
         prompt = c.event("prompt")
