@@ -197,6 +197,7 @@ test("real Pi TUI input suppresses debug across approval and focus; cancel await
     assert(statuses.some(text => text.includes(secondId)));
     const listed = await f.tools.get("shell_task")!.execute("t", { action: "list" }, undefined, undefined, ctx);
     assert.equal((JSON.stringify(listed).match(/waiting-for-user/g) ?? []).length, 2);
+    terminalInput("\x04"); await pause(20);
     for (const id of [firstId, secondId]) {
       const attached = f.commands.get("shell-attach")!.handler(id, ctx);
       const text = screen!.render(1000).join("\n");
@@ -236,6 +237,7 @@ test("repeated detached prompts notify once and clear persistent hints on expiry
     custom: (factory: Function) => new Promise(resolve => {
       const screen = factory({ requestRender() {}, terminal: { columns: 1000, rows: 100 } }, {}, {}, resolve);
       screen.render(1000); screen.handleInput("y");
+      if (screen.render(1000).join("\n").includes("Waiting for your input")) screen.handleInput("\x04");
     }),
   } } as unknown as ExtensionContext;
   try {
@@ -249,6 +251,148 @@ test("repeated detached prompts notify once and clear persistent hints on expiry
     assert.equal(changes.at(-1), undefined); assert.equal(notices.length, 1);
   } finally {
     await f.handlers.get("session_shutdown")!();
+    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
+    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
+  }
+});
+
+test("automatic prompts queue behind approval, serialize, avoid detach loops, expire and reset", async () => {
+  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  const f = fixture();
+  let screen!: import("../src/shell-screen.ts").ShellScreen;
+  let mounts = 0;
+  const notices: string[] = [];
+  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { notify(text: string) { notices.push(text); }, setStatus() {}, custom: (factory: Function) => new Promise(resolve => {
+    screen = factory({ requestRender() {}, terminal: { columns: 100, rows: 40 } }, {}, {}, (value: unknown) => resolve(value));
+    mounts++;
+  }) } } as unknown as ExtensionContext;
+  const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
+  const wait = async (condition: () => boolean) => { for (let i = 0; i < 200 && !condition(); i++) await pause(10); assert(condition()); };
+  const launch = () => f.tools.get("interactive_shell")!.execute("t", { command: "sleep .3; stty -echo; printf '[sudo] password for synthetic-user: '; read -r x; sleep .3; printf 'Next password: '; read -r x", background: true }, undefined, undefined, ctx);
+  const approve = () => { screen.render(100); screen.handleInput("y"); };
+  try {
+    let receipt = launch(); approve(); await receipt;
+    const second = launch();
+    await pause(650);
+    assert.equal(mounts, 2); // Approval holds focus while first prompt queues.
+    approve(); await second; await wait(() => mounts === 3);
+    assert(screen.render(100).join("\n").includes("[sudo] password for synthetic-user:"));
+    assert(notices[0].includes("[sudo] password for synthetic-user:"));
+    await pause(600); assert.equal(mounts, 3);
+    screen.handleInput("\x04"); await wait(() => mounts === 4);
+    screen.handleInput("\x04"); await pause(100); assert.equal(mounts, 4);
+    // Both live generations were detached, so neither reopens.
+    const list = await f.tools.get("shell_task")!.execute("l", { action: "list" }, undefined, undefined, ctx);
+    const tasks = JSON.parse((list.content[0] as { text: string }).text);
+    assert.equal(tasks.length, 2); assert(tasks.every((t: { prompt: string }) => t.prompt.includes("[sudo]")));
+    const attached = f.commands.get("shell-attach")!.handler(tasks[0].id, ctx);
+    screen.render(100); screen.handleInput("synthetic-only"); screen.handleInput("\r");
+    screen.handleInput("\x04"); await attached;
+    const beforeNext = mounts;
+    await wait(() => mounts > beforeNext);
+    assert(screen.render(100).join("\n").includes("Next password:"));
+    screen.handleInput("\x04"); await pause(30);
+    await f.handlers.get("session_start")!();
+    f.flags.set("interactive-shell-lease", "1");
+    receipt = launch(); approve(); await receipt;
+    const blocker = launch();
+    await pause(1600); const beforeExpiry = mounts;
+    screen.handleInput("\x1b"); await blocker; await pause(100);
+    assert.equal(mounts, beforeExpiry); // Expired queued generation must not focus.
+    await f.handlers.get("session_start")!();
+    receipt = launch(); approve(); await receipt;
+    const switching = launch(); await pause(650);
+    const beforeSwitch = mounts;
+    await f.handlers.get("session_start")!(); await switching; await pause(100);
+    assert.equal(mounts, beforeSwitch);
+  } finally {
+    await f.handlers.get("session_shutdown")!();
+    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
+    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
+  }
+});
+
+test("actual dispatcher retains interrupted input against editor and queued task, including old timer horizon", async () => {
+  const { TuiMainScreen } = await import("@earendil-works/pi-tui");
+  const { TaskRegistry } = await import("../src/task-registry.ts");
+  type Task = import("../src/task-registry.ts").ShellTask;
+  const originalStart = TaskRegistry.prototype.start;
+  const tasks: Task[] = [];
+  TaskRegistry.prototype.start = function (...args) { const task = originalStart.apply(this, args); if (task) tasks.push(task); return task; };
+  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  const f = fixture();
+  let dispatch!: (data: string) => void;
+  const tui = new TuiMainScreen({ columns: 100, rows: 40, kittyProtocolActive: false,
+    start(callback: (data: string) => void) { dispatch = callback; }, stop() {}, async drainInput() {}, write() {}, moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
+  });
+  const editorInput: string[] = [];
+  const editor = { render: () => ["sentinel editor"], invalidate() {}, handleInput: (data: string) => editorInput.push(data) };
+  let screen!: import("../src/shell-screen.ts").ShellScreen;
+  let mounts = 0;
+  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { notify() {}, setStatus() {}, custom: (factory: Function) => new Promise(resolve => {
+    screen = factory(tui, {}, {}, (value: unknown) => { tui.clear(); tui.addChild(editor); tui.setFocus(editor); screen.dispose(); resolve(value); });
+    tui.clear(); tui.addChild(screen); tui.setFocus(screen); mounts++;
+  }) } } as unknown as ExtensionContext;
+  tui.start();
+  const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
+  const frame = (task: Task, ...events: object[]) => (task as unknown as { receive(data: string): void }).receive(events.map(e => JSON.stringify(e)).join("\n") + "\n");
+  const prompt = (id: number) => ({ type: "prompt", id, lease: 60, text: `Synthetic request ${id}:` });
+  const launch = async () => {
+    const receipt = f.tools.get("interactive_shell")!.execute("t", { command: "sleep 30", background: true }, undefined, undefined, ctx);
+    tui.render(100); dispatch("y"); await receipt;
+  };
+  try {
+    await launch(); await launch();
+    const [first, second] = tasks;
+    const sent: object[] = [];
+    (first as unknown as { send(message: object): void }).send = message => sent.push(message);
+    frame(first, prompt(1)); await pause(10);
+    frame(second, prompt(1)); await pause(10);
+    const owner = screen, initialMounts = mounts;
+    dispatch("synthetic-prefix");
+    frame(first, { type: "invalidate" }, { type: "output", text: "changed" }, prompt(2));
+    dispatch("synthetic-suffix"); dispatch("\r");
+    assert.equal(screen, owner); assert.equal(mounts, initialMounts);
+    assert.deepEqual(editorInput, []); assert.deepEqual(sent, []);
+    assert(screen.render(100).join("\n").includes("Input interrupted"));
+    // A deliberate manual refresh accepts adjacent invalidate/prompt frames in this owner.
+    first.manual = () => frame(first, { type: "invalidate" }, prompt(3));
+    dispatch("\x10");
+    assert(screen.render(100).join("\n").includes("Synthetic request 3:"));
+    dispatch("synthetic-valid"); dispatch("\r");
+    assert(sent.some(m => JSON.stringify(m).includes('"value":"synthetic-valid"')));
+    await pause(10);
+    assert(screen.render(100).join("\n").includes(second.id));
+    const secondOwner = screen;
+    dispatch("synthetic-prefix");
+    frame(second, { type: "invalidate" }, { type: "done", status: "completed", exitCode: 0 });
+    dispatch("synthetic-suffix"); dispatch("\r");
+    await pause(10100);
+    dispatch("synthetic-after-timer"); dispatch("\r");
+    assert.equal(screen, secondOwner); assert.deepEqual(editorInput, []);
+    assert(screen.render(100).join("\n").includes("Input interrupted"));
+    dispatch("\x04"); await pause(10);
+    // A closing listener must not consume a fresh generation in the same batch.
+    frame(first, prompt(4)); await pause(10);
+    const closingOwner = screen;
+    dispatch("\x04"); frame(first, { type: "invalidate" }, prompt(5));
+    await pause(20);
+    assert.notEqual(screen, closingOwner);
+    assert(screen.render(100).join("\n").includes("Synthetic request 5:"));
+    dispatch("synthetic-prefix");
+    frame(first, { type: "invalidate" }); // Broker lease-expiry event.
+    dispatch("synthetic-suffix"); dispatch("\r");
+    assert.deepEqual(editorInput, []);
+    assert(screen.render(100).join("\n").includes("Input interrupted"));
+    const old = screen; dispatch("\x04"); await pause(10);
+    old.handleInput("synthetic-disposed"); old.handleInput("\r");
+    assert.equal(sent.filter(m => JSON.stringify(m).includes('"type":"input"')).length, 1);
+  } finally {
+    await f.handlers.get("session_shutdown")!(); tui.stop(); TaskRegistry.prototype.start = originalStart;
     if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
     if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
   }

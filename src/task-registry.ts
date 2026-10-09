@@ -15,7 +15,7 @@ export class ShellTask {
   private child?: ChildProcessWithoutNullStreams;
   private buffer = "";
   private listener?: (event: TaskEvent) => void;
-  private prompt?: { id: number; deadline: number };
+  private prompt?: { id: number; deadline: number; text: string };
   private deadline?: ReturnType<typeof setTimeout>;
   private escalation?: ReturnType<typeof setTimeout>;
   private resolve!: () => void;
@@ -66,12 +66,12 @@ export class ShellTask {
           this.output = (this.output + text).slice(-16384);
           this.listener?.({ type: "output", text });
         } else if (event.type === "prompt" && Number.isSafeInteger(event.id) && Number.isFinite(event.lease) && event.lease > 0 && event.lease <= 120) {
-          this.prompt = { id: event.id, deadline: performance.now() + event.lease * 1000 };
+          this.prompt = { id: event.id, deadline: performance.now() + event.lease * 1000, text: typeof event.text === "string" ? event.text.replace(/[^\x20-\x7e]/g, " ").trim().slice(-256) || "Input requested (prompt text unavailable)" : "Input requested (prompt text unavailable)" };
           this.status = "waiting-for-user";
           clearTimeout(this.promptTimer);
           this.promptTimer = setTimeout(() => this.invalidate(), event.lease * 1000);
           this.updateWaiting();
-          this.listener?.({ type: "prompt", id: event.id, lease: event.lease });
+          this.listener?.({ type: "prompt", id: event.id, lease: event.lease, text: this.prompt.text });
         } else if (event.type === "invalidate" || event.type === "submitted") this.invalidate();
       } catch { this.stop("error"); return; }
     }
@@ -95,7 +95,7 @@ export class ShellTask {
     this.updateWaiting();
     listener({ type: "output", text: this.output });
     // Reconnect never extends an existing generation's lease.
-    if (this.prompt && this.prompt.deadline > performance.now()) listener({ type: "prompt", id: this.prompt.id, lease: (this.prompt.deadline - performance.now()) / 1000 });
+    if (this.prompt && this.prompt.deadline > performance.now()) listener({ type: "prompt", id: this.prompt.id, lease: (this.prompt.deadline - performance.now()) / 1000, text: this.prompt.text });
     return true;
   }
   detach() {
@@ -129,10 +129,14 @@ export class ShellTask {
     this.escalation = setTimeout(() => this.child?.kill("SIGKILL"), 1500);
     return this.done;
   }
+  pendingPrompt() {
+    if (this.prompt && this.prompt.deadline <= performance.now()) this.invalidate();
+    return this.prompt ? { ...this.prompt } : undefined;
+  }
   read() { return this.output; }
   summary() {
     if (this.prompt && this.prompt.deadline <= performance.now()) this.invalidate();
-    return { id: this.id, status: this.status, exitCode: this.exitCode, attach: `/shell-attach ${this.id}` };
+    return { id: this.id, status: this.status, prompt: this.prompt?.text, exitCode: this.exitCode, attach: `/shell-attach ${this.id}` };
   }
   erase() { this.output = ""; this.buffer = ""; this.detach(); }
 }

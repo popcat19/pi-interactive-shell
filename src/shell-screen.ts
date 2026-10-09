@@ -16,6 +16,8 @@ export type ScreenActions = {
 
 export class ShellScreen {
   private phase: "approval" | "running" | "done" = "approval";
+  private interrupted = false;
+  private refreshing = false;
   private command: string;
   private page = 0;
   private pages = 1;
@@ -31,7 +33,7 @@ export class ShellScreen {
   private style: (role: "accent" | "warning" | "success", text: string) => string;
   private output = "";
   private secret = "";
-  private prompt?: { id: number; deadline: number };
+  private prompt?: { id: number; deadline: number; text: string };
   private status = "Approval required";
   private timer: ReturnType<typeof setInterval>;
   private disposed = false;
@@ -57,25 +59,29 @@ export class ShellScreen {
     this.identity = `Task ${id}`;
   }
   invalidate() { this.previewRendered = false; }
-  invalidatePrompt() {
+  invalidatePrompt(deliberate = false) {
+    if (this.prompt && !deliberate) this.interrupted = true;
     this.secret = "";
     this.prompt = undefined;
     this.redraw();
   }
   event(event: { type: string; text?: string; id?: number; lease?: number; status?: string }) {
-    if (this.disposed) return;
+    if (this.disposed) return false;
     if (event.type === "output") {
       this.invalidatePrompt();
       // ASCII-only second boundary rejects terminal controls even if the broker is faulty.
       const text = (event.text ?? "").replace(/[^\x20-\x7e\n]/g, "?");
       this.output = (this.output + text).slice(-16384);
     } else if (event.type === "prompt" && Number.isSafeInteger(event.id) && Number.isFinite(event.lease)) {
-      this.invalidatePrompt();
-      this.prompt = { id: event.id!, deadline: performance.now() + event.lease! * 1000 };
+      this.invalidatePrompt(this.refreshing);
+      if (this.interrupted) return false;
+      this.refreshing = false;
+      this.prompt = { id: event.id!, deadline: performance.now() + event.lease! * 1000, text: (event.text ?? "Input requested (prompt text unavailable)").replace(/[^\x20-\x7e]/g, " ").slice(-256) };
     } else if (event.type === "invalidate" || event.type === "submitted") {
       this.invalidatePrompt();
     }
     this.redraw();
+    return event.type === "prompt";
   }
   finish(status: string) {
     this.invalidatePrompt();
@@ -85,8 +91,15 @@ export class ShellScreen {
   }
   handleInput(data: string) {
     if (this.disposed || isKeyRelease(data)) return;
+    if (this.interrupted) {
+      if (matchesKey(data, "escape") || matchesKey(data, "ctrl+d")) this.actions.close();
+      else if (matchesKey(data, "ctrl+p") && this.phase !== "done") {
+        this.interrupted = false; this.refreshing = true; this.actions.manual();
+      }
+      return;
+    }
     if (this.phase === "running" && matchesKey(data, "ctrl+d") && this.actions.detach) {
-      this.invalidatePrompt(); this.actions.detach(); return;
+      this.invalidatePrompt(true); this.actions.detach(); return;
     }
     if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
       this.secret = "";
@@ -113,14 +126,15 @@ export class ShellScreen {
     } else if (this.phase === "done") {
       if (matchesKey(data, "enter")) this.actions.close();
     } else if (matchesKey(data, "ctrl+p")) {
-      this.invalidatePrompt();
+      this.refreshing = true;
+      this.invalidatePrompt(true);
       this.actions.manual();
     } else if (this.prompt) {
       if (performance.now() >= this.prompt.deadline) this.invalidatePrompt();
       else if (matchesKey(data, "enter")) {
         const { id } = this.prompt;
         const value = this.secret;
-        this.invalidatePrompt();
+        this.invalidatePrompt(true);
         this.actions.submit(id, value);
       } else if (matchesKey(data, "backspace")) this.secret = Array.from(this.secret).slice(0, -1).join("");
       else if (matchesKey(data, "ctrl+u")) this.secret = "";
@@ -154,10 +168,10 @@ export class ShellScreen {
       this.reviewed.add(this.page); this.previewRendered = true;
       lines = [...title.map(line => this.style("accent", line)), ...content.slice(this.page * pageSize, (this.page + 1) * pageSize), `Review page ${this.page + 1}/${this.pages}`, ...hints];
     } else {
-      const state = this.phase === "done" ? `:: ${this.status}` : this.prompt ? ":: Waiting for your input" : ":: Running";
+      const state = this.interrupted ? ":: Input interrupted. Response discarded; typing ignored." : this.phase === "done" ? `:: ${this.status}` : this.prompt ? ":: Waiting for your input" : ":: Process active (readiness unknown)";
       const header = [...wrap(state).map(line => this.style(this.prompt ? "warning" : "accent", line)), ...wrap(this.identity)];
-      const response = this.prompt ? wrap(`Response (masked, ${Math.max(0, Math.ceil((this.prompt.deadline - performance.now()) / 1000))}s): ${"*".repeat(Math.min(60, Array.from(this.secret).length))}`) : [];
-      const hints = wrap(this.phase === "done" ? "PgUp/PgDn: output | Enter/Esc: close" : this.prompt ? "Enter: send | Ctrl+U: clear | Ctrl+D: detach | Esc: stop | PgUp/PgDn: output" : "Ctrl+P: input | Ctrl+D: detach | Esc: stop | PgUp/PgDn: output");
+      const response = this.prompt ? [...wrap(`Program-provided request: ${this.prompt.text}`), ...wrap(`Response (masked, ${Math.max(0, Math.ceil((this.prompt.deadline - performance.now()) / 1000))}s): ${"*".repeat(Math.min(60, Array.from(this.secret).length))}`)] : [];
+      const hints = wrap(this.interrupted ? "Esc/Ctrl+D: acknowledge and close | Ctrl+P: request fresh input" : this.phase === "done" ? "PgUp/PgDn: output | Enter/Esc: close" : this.prompt ? "Enter: send | Ctrl+U: clear | Ctrl+D: detach | Esc: stop | PgUp/PgDn: output" : "Ctrl+P: input | Ctrl+D: detach | Esc: stop | PgUp/PgDn: output");
       const pageSize = Math.max(1, limit - header.length - response.length - hints.length - 1);
       const outputLines = wrap(this.output || "(No output yet)");
       this.outputPages = Math.max(1, Math.ceil(outputLines.length / pageSize));

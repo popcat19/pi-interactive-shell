@@ -18,7 +18,7 @@ Requires Linux, Python 3, bash, and Pi's interactive TUI with TTY stdin and stdo
 | `/shell-attach ID` | Focus task output and masked input |
 | `/shell-stop ID` | Stop the task and await cleanup |
 
-`interactive_shell` takes `command`, optional `timeout` (1..3600 seconds), and optional `background` (default false). Foreground results return task metadata and the latest bounded sanitized output. Background calls return an ID immediately after approval. `shell_task` takes `action` (`list`, `status`, `read`, `stop`) and `id` except for list. Status, read, and stop return latest output; list returns metadata. Tools cannot submit responses. Local commands display output through the task screen; reattach to browse completed output.
+`interactive_shell` takes `command`, optional `timeout` (1..3600 seconds), and optional `background` (default false). Foreground results return task metadata and the latest bounded sanitized output. Background calls return an ID immediately after approval. This confirms launch, not readiness or substantive progress. Live waiting task summaries include the program-provided prompt. `shell_task` takes `action` (`list`, `status`, `read`, `stop`) and `id` except for list. Status, read, and stop return latest output; list returns metadata. Tools cannot submit responses. Local commands display output through the task screen; reattach to browse completed output.
 
 Enable optional approval-gated agent bash only per launch:
 
@@ -39,11 +39,13 @@ Task screens show task ID, running/completed state, or **Waiting for your input*
 - Ctrl+P requests a fresh manual prompt when automatic detection misses it or its lease expires.
 - Ctrl+D detaches without stopping the task; `/shell-attach ID` reconnects.
 - Esc or Ctrl+C stops a running task and waits for cleanup before its receipt returns.
-- Enter or Esc closes a completed screen; it also auto-closes after 10 seconds.
+- Enter or Esc closes a completed screen; completed screens do not close on a timer.
 
 Layouts are bounded by terminal height and width. Very small terminals show an enlarge-terminal instruction instead of accepting an unreadable approval. One screen can own interactive input at a time; competing requests return `busy`.
 
-Background prompts never steal focus. One local notification per task and a persistent status line say `Waiting for your input` and provide `/shell-attach ID`. Later prompt generations update only the status line. The hint clears on expiry, invalidation, submission, attachment, stop, or completion; detaching an active prompt restores it without another notification. No typed response is copied into those notifications. An expired prompt lease requires Ctrl+P on attachment if no fresh prompt is detected.
+Background prompts automatically open local masked input when no shell approval/input screen is active. Multiple tasks queue in arrival order, one live generation per task. Ownership, lease, UI availability, and logging guards are checked again before focus. Expired generations and session replacement discard queued opens. Automatic input screens close only after explicit submission or a deliberate close/cancel action; no keys are submitted automatically. Unsolicited output, invalidation, expiry, or completion during a response clears provisional text and retains an inert input owner. Continued typing and Enter are ignored. Esc/Ctrl+D explicitly acknowledges and closes this neutral screen; Ctrl+P deliberately requests a fresh generation while the task remains active. New generations cannot silently replace an interrupted response, and no completion timer releases focus. Ctrl+D suppresses reopening that generation; a later prompt generation can open again. Use `/shell-attach ID` to return manually.
+
+A once-per-task warning and persistent status show a bounded, sanitized program-provided request, such as `[sudo] password for synthetic-user:`; no command identity is inferred. The same live context appears in task summaries and attached input. Context is at most 256 ASCII characters from the current output line, cleared between generations. Echo-off without recognizable text and manual input show `Input requested (prompt text unavailable)`. Responses are never directly copied into the prompt cache; commands that echo responses still expose output and can produce misleading prompt text. Status hints clear on invalidation, expiry, submission, attachment, stop, and completion. Runtime timeout continues while prompts wait in the queue.
 
 ## Timeouts and ownership
 

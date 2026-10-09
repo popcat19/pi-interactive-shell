@@ -12,6 +12,18 @@ const statusResult = (status: string) => result(`Shell status: ${status}.`);
 export default function extension(pi: ExtensionAPI) {
   let registry = new TaskRegistry();
   let busy = false;
+  const pending = new Map<string, { task: ShellTask; generation: number; owner: TaskRegistry; ctx: ExtensionContext }>();
+  const focused = new WeakMap<ShellTask, number>();
+  function drain() {
+    if (busy) return;
+    for (const [id, item] of pending) {
+      pending.delete(id);
+      if (item.owner !== registry || registry.get(id) !== item.task || item.task.pendingPrompt()?.id !== item.generation || focused.get(item.task) === item.generation || !available(item.ctx) || logging()) continue;
+      busy = true;
+      void focus(item.task, item.ctx, undefined, true).catch(() => {}).finally(() => { busy = false; drain(); });
+      break;
+    }
+  }
   let closeActive: (() => void) | undefined;
   pi.registerFlag("interactive-shell-bash", { type: "boolean", default: false, description: "Require approval and broker ALL agent bash calls" });
   pi.registerFlag("interactive-shell-timeout", { type: "string", default: "300", description: "Task deadline in seconds, 1..3600" });
@@ -39,28 +51,38 @@ export default function extension(pi: ExtensionAPI) {
       clearTimeout(timer); screen?.dispose(); restoreDebug?.(); closeActive = undefined;
     }
   }
-  async function focus(task: ShellTask, ctx: ExtensionContext, signal?: AbortSignal) {
+  async function focus(task: ShellTask, ctx: ExtensionContext, signal?: AbortSignal, automatic = false) {
     let restoreDebug: (() => void) | undefined;
     let screen: ShellScreen | undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
     let cancellation: Promise<void> | undefined;
-    const cancel = () => { cancellation ??= task.stop(); closeActive?.(); };
+    let closing = false;
+    let close = () => {};
+    const cancel = () => { cancellation ??= task.stop(); close(); };
     signal?.addEventListener("abort", cancel, { once: true });
     try {
       await ctx.ui.custom<void>((tui, theme, _keys, done) => {
         restoreDebug = suppressDebug(tui);
-        closeActive = () => done();
-        screen = new ShellScreen("", { approve() {}, cancel, close: done, detach: done, manual: () => task.manual(), submit: (id, value) => task.submit(id, value) }, () => tui.requestRender(), "", () => tui.terminal?.columns ?? 80, () => tui.terminal?.rows ?? 24, (role, text) => theme.fg?.(role, text) ?? text);
+        close = () => { if (closing) return; closing = true; done(); };
+        closeActive = close;
+        screen = new ShellScreen("", {
+          approve() {}, cancel, close, detach: close,
+          manual: () => task.manual(),
+          submit: (id, value) => { task.submit(id, value); if (automatic) close(); },
+        }, () => tui.requestRender(), "", () => tui.terminal?.columns ?? 80, () => tui.terminal?.rows ?? 24, (role, text) => theme.fg?.(role, text) ?? text);
         screen.start(task.id);
-        const finish = () => { screen?.finish(task.status); timer ??= setTimeout(done, 10000); };
-        task.attach(event => { if (event.type === "done") finish(); else screen?.event(event); });
-        if (!task.active) finish();
+        task.attach(event => {
+          if (closing) return;
+          if (event.type === "done") screen?.finish(task.status);
+          else if (screen?.event(event) && event.type === "prompt") focused.set(task, event.id!);
+        });
+        if (!task.active) screen.finish(task.status);
         if (signal?.aborted) queueMicrotask(cancel);
         return screen;
       });
     } finally {
+      closing = true;
       signal?.removeEventListener("abort", cancel);
-      task.detach(); screen?.dispose(); clearTimeout(timer); restoreDebug?.(); closeActive = undefined;
+      task.detach(); screen?.dispose(); restoreDebug?.(); closeActive = undefined;
       await cancellation;
     }
   }
@@ -81,12 +103,18 @@ export default function extension(pi: ExtensionAPI) {
       if (signal?.aborted || registry !== owner || logging()) return statusResult("cancelled");
       let notified = false;
       task = owner.start(command, ctx.cwd, seconds, lease, (waiting, needsInput) => {
-        if (!needsInput) { ctx.ui.setStatus?.(`shell-${waiting.id}`, undefined); return; }
+        if (!needsInput) { pending.delete(waiting.id); ctx.ui.setStatus?.(`shell-${waiting.id}`, undefined); return; }
         if (owner !== registry) return;
-        ctx.ui.setStatus?.(`shell-${waiting.id}`, `Waiting for your input: /shell-attach ${waiting.id}`);
+        const prompt = waiting.pendingPrompt();
+        if (!prompt) return;
+        ctx.ui.setStatus?.(`shell-${waiting.id}`, `Task ${waiting.id}: ${prompt.text} | /shell-attach ${waiting.id}`);
+        if (focused.get(waiting) !== prompt.id) {
+          pending.set(waiting.id, { task: waiting, generation: prompt.id, owner, ctx });
+          queueMicrotask(drain);
+        }
         if (notified) return;
         notified = true;
-        ctx.ui.notify(`Waiting for your input. Task ${waiting.id}. Run /shell-attach ${waiting.id}. Runtime timeout includes prompt wait.`, "warning");
+        ctx.ui.notify(`Waiting for your input. Task ${waiting.id}. Program-provided request: ${prompt.text}. Run /shell-attach ${waiting.id}. Runtime timeout includes prompt wait.`, "warning");
       });
       if (!task) return statusResult("task-limit");
       void task.done.then(() => ctx.ui.setStatus?.(`shell-${task!.id}`, undefined));
@@ -95,15 +123,15 @@ export default function extension(pi: ExtensionAPI) {
     } catch {
       if (task) await task.stop();
       return statusResult("error");
-    } finally { busy = false; }
+    } finally { busy = false; drain(); }
   }
   const parameters = Type.Object({
     command: Type.String({ description: "Exact bash command. Never include credentials." }),
     timeout: Type.Optional(Type.Number({ minimum: 1, maximum: 3600 })),
-    background: Type.Optional(Type.Boolean({ description: "Return task receipt immediately after approval; never auto-focus prompts." })),
+    background: Type.Optional(Type.Boolean({ description: "Return task receipt immediately after approval; launch receipt is not readiness; pending prompts auto-open local masked input." })),
   });
   pi.registerTool({
-    name: "interactive_shell", label: "Session shell", description: "Run exact command with local approval and masked TUI responses. Bounded output is returned. Background jobs return IDs; waiting-for-user requires local /shell-attach ID. Never request secrets in chat. No durable services.", parameters,
+    name: "interactive_shell", label: "Session shell", description: "Run exact command with local approval and masked TUI responses. Bounded output is returned. Background IDs confirm launch, not readiness. waiting-for-user includes a live program-provided prompt; masked input opens locally, or use /shell-attach ID. Never request secrets in chat. No durable services.", parameters,
     execute: async (_id, args, signal, _update, ctx) => run(args.command, args.timeout, args.background ?? false, ctx, signal),
   });
   pi.registerTool({
@@ -142,9 +170,10 @@ export default function extension(pi: ExtensionAPI) {
     if (!task) { ctx.ui.notify("Shell task not found", "info"); return; }
     busy = true;
     ctx.ui.setStatus?.(`shell-${task.id}`, undefined);
-    try { await focus(task, ctx); } catch { ctx.ui.notify("Shell screen unavailable", "error"); } finally { busy = false; }
+    try { await focus(task, ctx); } catch { ctx.ui.notify("Shell screen unavailable", "error"); } finally { busy = false; drain(); }
   } });
   pi.on("session_start", async () => {
+    pending.clear();
     closeActive?.();
     const previous = registry;
     registry = new TaskRegistry();
@@ -157,6 +186,7 @@ export default function extension(pi: ExtensionAPI) {
     await cleanup;
   });
   pi.on("session_shutdown", async () => {
+    pending.clear();
     closeActive?.();
     const old = registry;
     registry = new TaskRegistry();

@@ -199,6 +199,27 @@ assert signal.SIGTERM not in signal.pthread_sigmask(signal.SIG_BLOCK, set())
         c = self.client("kill -TERM $$; exit 42")
         self.assertEqual(c.event("done")["exitCode"], -15)
 
+    def test_prompt_context_split_chunks_and_generation_reset(self):
+        c = self.client("stty -echo; printf '[sudo] pass'; sleep .05; printf 'word for synthetic-user: '; read -r x; printf 'Next code: '; read -r x")
+        first = c.event("prompt")
+        self.assertEqual(first["text"], "[sudo] password for synthetic-user:")
+        c.send({"type": "input", "id": first["id"], "value": "synthetic-only"})
+        second = c.event("prompt")
+        self.assertEqual(second["text"], "Next code:")
+        self.assertNotIn("synthetic-only", second["text"])
+        c.send({"type": "input", "id": second["id"], "value": "synthetic-only"})
+        self.assertEqual(c.event("done")["status"], "completed")
+
+    def test_prompt_context_unknown_manual_and_bounds(self):
+        c = self.client("stty -echo; read -r x")
+        self.assertEqual(c.event("prompt")["text"], "Input requested (prompt text unavailable)")
+        c.send({"type": "manual"})
+        self.assertEqual(c.event("prompt")["text"], "Input requested (prompt text unavailable)")
+        d = self.client("stty -echo; printf '%0300d password: ' 1; read -r x")
+        prompt = d.event("prompt")["text"]
+        self.assertLessEqual(len(prompt), 256)
+        self.assertTrue(all(32 <= ord(ch) < 127 for ch in prompt))
+
     def test_malformed_input_fails_without_raw_error(self):
         c = self.client("sleep 10")
         c.process.stdin.write(b"not-json\n")

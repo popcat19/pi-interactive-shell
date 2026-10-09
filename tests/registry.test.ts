@@ -124,3 +124,18 @@ test("waiting lifecycle clears on invalidation, expiry, attachment, submission a
     await task.stop(); assert.equal(transitions.at(-1), false);
   } finally { await registry.shutdown(); }
 });
+
+test("summary contains only live prompt context, never submitted response cache", async () => {
+  const registry = new TaskRegistry();
+  try {
+    const task = registry.start("stty -echo; printf 'Password: '; read -r x; sleep .3; printf 'Next code: '; read -r x", "/tmp", 3, 1)!;
+    for (let i = 0; i < 100 && !task.pendingPrompt(); i++) await pause(10);
+    assert.equal(task.summary().prompt, "Password:");
+    let id = 0; task.attach(event => { if (event.type === "prompt") id = event.id!; });
+    task.submit(id, "synthetic-only");
+    assert.equal(task.summary().prompt, undefined);
+    for (let i = 0; i < 100 && !task.pendingPrompt(); i++) await pause(10);
+    assert.equal(task.summary().prompt, "Next code:");
+    await task.stop(); assert.equal(task.summary().prompt, undefined);
+  } finally { await registry.shutdown(); }
+});

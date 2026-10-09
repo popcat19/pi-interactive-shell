@@ -138,3 +138,33 @@ test("approval defaults deny and short terminals fail closed within height", () 
     screen.handleInput("\r"); assert.equal(denied, 1); assert.equal(approved, 0);
   } finally { screen.dispose(); }
 });
+
+test("program-provided prompt is sanitized, labelled and cleared on invalidation", () => {
+  const f = fixture();
+  try {
+    f.screen.start("synthetic-task");
+    f.screen.event({ type: "prompt", id: 1, lease: 10, text: "[sudo] password for synthetic-user:\x1b\n" });
+    const text = f.screen.render(80).join("\n");
+    assert(text.includes("Program-provided request: [sudo] password for synthetic-user:"));
+    assert(text.includes("Task synthetic-task")); assert(!text.includes("\x1b"));
+    for (const width of [1, 20, 40, 80]) assert(f.screen.render(width).every(l => visibleWidth(l) <= width));
+    f.screen.event({ type: "invalidate" });
+    assert(!f.screen.render(80).join("\n").includes("[sudo]"));
+  } finally { f.screen.dispose(); }
+});
+
+test("local lease expiry and completion retain inert ownership until deliberate acknowledgement", async () => {
+  let closes = 0, submits = 0;
+  const screen = new ShellScreen("", { approve() {}, cancel() {}, close() { closes++; }, detach() { closes++; }, manual() {}, submit() { submits++; } }, () => {});
+  try {
+    screen.start("expiry-task");
+    screen.event({ type: "prompt", id: 1, lease: .001, text: "Synthetic password:" });
+    screen.handleInput("prefix"); await new Promise(r => setTimeout(r, 150));
+    screen.event({ type: "prompt", id: 2, lease: 10, text: "New request:" });
+    screen.handleInput("suffix"); screen.handleInput("\r"); screen.finish("completed"); screen.handleInput("\r");
+    assert.equal(closes, 0); assert.equal(submits, 0);
+    const rendered = screen.render(100).join("\n");
+    assert(rendered.includes("Input interrupted")); assert(!rendered.includes("New request:")); assert(!rendered.includes("prefix"));
+    screen.handleInput("\x1b"); assert.equal(closes, 1);
+  } finally { screen.dispose(); }
+});

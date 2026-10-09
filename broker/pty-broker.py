@@ -56,11 +56,13 @@ class Broker:
             return False
         return True
 
-    def prompt(self):
+    def prompt(self, manual=False):
         self.invalidate()
         self.serial += 1
         self.active = (self.serial, time.monotonic() + self.config["lease"], self.attrs())
-        emit({"type": "prompt", "id": self.serial, "lease": self.config["lease"]})
+        text = self.tail.rstrip().split("\n")[-1].strip()
+        text = text[-256:] if not manual and CUE.search(text) else "Input requested (prompt text unavailable)"
+        emit({"type": "prompt", "id": self.serial, "lease": self.config["lease"], "text": text})
         self.pending_cue = False
         self.tail = ""
 
@@ -89,7 +91,7 @@ class Broker:
             return False
         if kind == "manual":
             self.drain()
-            self.prompt()
+            self.prompt(manual=True)
         elif kind == "input":
             self.drain()
             active = self.active
