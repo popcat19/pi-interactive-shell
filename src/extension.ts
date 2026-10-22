@@ -1,4 +1,4 @@
-// Purpose: Gate session PTY tasks and masked input behind local TUI approval.
+// Purpose: Run session PTY tasks with local interactive terminal input.
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -42,32 +42,11 @@ export default function extension(pi: ExtensionAPI) {
     }
   }
   let closeActive: (() => void) | undefined;
-  pi.registerFlag("interactive-shell-bash", { type: "boolean", default: false, description: "Require approval and broker ALL agent bash calls" });
-  pi.registerFlag("interactive-shell-timeout", { type: "string", default: "300", description: "Task deadline in seconds, 1..3600" });
-  pi.registerFlag("interactive-shell-lease", { type: "string", default: "30", description: "Masked prompt lease in seconds, 1..120" });
+  pi.registerFlag("interactive-shell-bash", { type: "boolean", default: false, description: "Route ALL agent bash calls through the interactive PTY" });
+  pi.registerFlag("interactive-shell-timeout", { type: "string", default: "0", description: "Optional task deadline in seconds; 0 disables it" });
+  pi.registerFlag("interactive-shell-lease", { type: "string", default: "0", description: "Unused compatibility flag" });
   const available = (ctx: ExtensionContext) => ctx.mode === "tui" && ctx.hasUI && process.stdin.isTTY && process.stdout.isTTY && process.platform === "linux";
   const logging = () => LOGGING.some(key => Boolean(process.env[key]));
-  async function approve(text: string, heading: string, ctx: ExtensionContext, signal?: AbortSignal) {
-    let restoreDebug: (() => void) | undefined;
-    let screen: ShellScreen | undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let cancel: (() => void) | undefined;
-    try {
-      return await ctx.ui.custom<boolean>((tui, theme, _keys, done) => {
-        restoreDebug = suppressDebug(tui);
-        cancel = () => done(false);
-        closeActive = cancel;
-        screen = new ShellScreen(text, { approve: () => done(!signal?.aborted && !logging()), cancel, close: cancel, manual() {}, submit() {} }, () => tui.requestRender(), heading, () => tui.terminal?.columns ?? 0, () => tui.terminal?.rows ?? 24, (role, text) => theme.fg?.(role, text) ?? text);
-        timer = setTimeout(cancel, 60000);
-        signal?.addEventListener("abort", cancel, { once: true });
-        if (signal?.aborted) queueMicrotask(cancel);
-        return screen;
-      });
-    } finally {
-      if (cancel) signal?.removeEventListener("abort", cancel);
-      clearTimeout(timer); screen?.dispose(); restoreDebug?.(); closeActive = undefined;
-    }
-  }
   async function focus(task: ShellTask, ctx: ExtensionContext, signal?: AbortSignal, automatic = false) {
     let restoreDebug: (() => void) | undefined;
     let screen: ShellScreen | undefined;
@@ -81,11 +60,11 @@ export default function extension(pi: ExtensionAPI) {
         restoreDebug = suppressDebug(tui);
         close = () => { if (closing) return; closing = true; done(); };
         closeActive = close;
-        screen = new ShellScreen("", {
-          approve() {}, cancel, close, detach: close,
-          manual: () => task.manual(),
-          submit: (id, value) => { task.submit(id, value); if (automatic) close(); },
-        }, () => tui.requestRender(), "", () => tui.terminal?.columns ?? 80, () => tui.terminal?.rows ?? 24, (role, text) => theme.fg?.(role, text) ?? text);
+        screen = new ShellScreen({
+          cancel, close, detach: close,
+          input: data => task.input(data),
+          resize: (columns, rows) => task.resize(columns, rows),
+        }, () => tui.requestRender(), () => tui.terminal?.rows ?? 24, (role, text) => theme.fg?.(role, text) ?? text);
         screen.start(task.id);
         task.attach(event => {
           if (closing) return;
@@ -108,15 +87,13 @@ export default function extension(pi: ExtensionAPI) {
     if (logging()) return statusResult("logging-blocked");
     if (busy) return statusResult("busy");
     const seconds = timeout ?? Number(pi.getFlag("interactive-shell-timeout"));
-    const lease = Number(pi.getFlag("interactive-shell-lease"));
-    if (typeof command !== "string" || !command || command.length > 8192 || command.includes("\0") || !Number.isFinite(seconds) || seconds < 1 || seconds > 3600 || !Number.isFinite(lease) || lease < 1 || lease > 120) return statusResult("invalid-request");
+    const lease = 0;
+    if (typeof command !== "string" || !command || command.length > 8192 || command.includes("\0") || !Number.isFinite(seconds) || seconds < 0 || seconds > 3600 || !Number.isFinite(lease) || lease < 0 || lease > 120) return statusResult("invalid-request");
     if (signal?.aborted) return statusResult("cancelled");
     busy = true;
     const owner = registry;
     let task: ShellTask | undefined;
     try {
-      const heading = "Warning: command output reaches the model and transcript. Echoed credentials are exposed; no secret redaction.";
-      if (!await approve(command, `${heading} ${background ? "Background session task" : "Foreground task"}; deadline ${seconds}s. No durable services.`, ctx, signal)) return statusResult("denied");
       if (signal?.aborted || registry !== owner || logging()) return statusResult("cancelled");
       let notified = false;
       task = owner.start(command, ctx.cwd, seconds, lease, (waiting, needsInput) => {
@@ -131,7 +108,7 @@ export default function extension(pi: ExtensionAPI) {
         }
         if (notified) return;
         notified = true;
-        ctx.ui.notify(`Waiting for your input. Task ${waiting.id}. Program-provided request: ${prompt.text}. Run /shell-attach ${waiting.id}. Runtime timeout includes prompt wait.`, "warning");
+        ctx.ui.notify(`Waiting for your input. Task ${waiting.id}. Program-provided request: ${prompt.text}. Run /shell-attach ${waiting.id}. Input remains available until the task exits.`, "warning");
       });
       if (!task) return statusResult("task-limit");
       completions.set(task, { owner, eligible: background || local });
@@ -158,12 +135,12 @@ export default function extension(pi: ExtensionAPI) {
     } finally { busy = false; drain(); }
   }
   const parameters = Type.Object({
-    command: Type.String({ description: "Exact bash command. Never include credentials." }),
-    timeout: Type.Optional(Type.Number({ minimum: 1, maximum: 3600 })),
-    background: Type.Optional(Type.Boolean({ description: "Return task receipt immediately after approval; launch receipt is not readiness; pending prompts auto-open local masked input." })),
+    command: Type.String({ description: "Exact bash command, including SSH or su login commands." }),
+    timeout: Type.Optional(Type.Number({ minimum: 0, maximum: 3600 })),
+    background: Type.Optional(Type.Boolean({ description: "Return task receipt immediately after launch; launch receipt is not readiness; pending prompts auto-open local masked input." })),
   });
   pi.registerTool({
-    name: "interactive_shell", label: "Session shell", description: "Run exact command with local approval and masked TUI responses. Bounded output is returned. Background IDs confirm launch, not readiness. waiting-for-user includes a live program-provided prompt; masked input opens locally, or use /shell-attach ID. Never request secrets in chat. No durable services.", parameters,
+    name: "interactive_shell", label: "Session shell", description: "Run a command immediately in an interactive Linux PTY. Local input passes directly to the process. Esc stops; Ctrl+] detaches. No default timeout. Output reaches the model. Background prompts open locally; use /shell-attach ID to reconnect. Never request credentials in chat.", parameters,
     execute: async (_id, args, signal, _update, ctx) => run(args.command, args.timeout, args.background ?? false, ctx, signal),
   });
   pi.registerTool({
@@ -180,7 +157,7 @@ export default function extension(pi: ExtensionAPI) {
     },
   });
   for (const [name, background] of [["shell", false], ["shell-bg", true]] as const) {
-    pi.registerCommand(name, { description: `Approve ${background ? "background" : "foreground"} command`, handler: async (command, ctx) => {
+    pi.registerCommand(name, { description: `Run ${background ? "background" : "foreground"} command`, handler: async (command, ctx) => {
       const response = await run(command, undefined, background, ctx, ctx.signal, true);
       // Do not copy visible command output to notifications.
       const text = response.content[0].text;
@@ -196,7 +173,7 @@ export default function extension(pi: ExtensionAPI) {
     if (task) await task.stop();
     ctx.ui.notify(task ? `Shell task ${task.id}: ${task.status}` : "Shell task not found", "info");
   } });
-  pi.registerCommand("shell-attach", { description: "Focus an existing session task; Ctrl+D detaches without stopping", handler: async (id, ctx) => {
+  pi.registerCommand("shell-attach", { description: "Focus an existing session task; Ctrl+] detaches without stopping", handler: async (id, ctx) => {
     if (!available(ctx) || logging() || busy) return;
     const task = registry.get(id.trim());
     if (!task) { ctx.ui.notify("Shell task not found", "info"); return; }
@@ -213,7 +190,7 @@ export default function extension(pi: ExtensionAPI) {
     const cleanup = previous.shutdown();
     if (pi.getFlag("interactive-shell-bash") === true) {
       const original = createBashTool(process.cwd());
-      pi.registerTool({ name: "bash", label: "Interactive bash", description: "All bash calls require local TUI approval; bounded output and masked responses. Never put credentials in arguments.", parameters: original.parameters,
+      pi.registerTool({ name: "bash", label: "Interactive bash", description: "All bash calls use the interactive Linux PTY; terminal input is forwarded directly.", parameters: original.parameters,
         execute: async (_id, args, signal, _update, ctx) => run(args.command, args.timeout, false, ctx, signal) });
     }
     await cleanup;

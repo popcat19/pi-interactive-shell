@@ -37,7 +37,7 @@ export class ShellTask {
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (data: string) => this.receive(data));
       this.send({ command, cwd, timeout, lease });
-      this.deadline = setTimeout(() => this.stop("timeout"), (timeout + 2) * 1000);
+      if (timeout > 0) this.deadline = setTimeout(() => this.stop("timeout"), (timeout + 2) * 1000);
     } catch { this.status = "error"; this.finish(); }
   }
   get active() { return !this.closed; }
@@ -62,14 +62,14 @@ export class ShellTask {
           this.invalidate();
         } else if (event.type === "output" && typeof event.text === "string") {
           this.invalidate();
-          const text = event.text.replace(/[^\x20-\x7e\n]/g, "?");
+          const text = event.text.replace(/\r/g, "").replace(/[^\x20-\x7e\n]/g, " ");
           this.output = (this.output + text).slice(-16384);
           this.listener?.({ type: "output", text });
-        } else if (event.type === "prompt" && Number.isSafeInteger(event.id) && Number.isFinite(event.lease) && event.lease > 0 && event.lease <= 120) {
-          this.prompt = { id: event.id, deadline: performance.now() + event.lease * 1000, text: typeof event.text === "string" ? event.text.replace(/[^\x20-\x7e]/g, " ").trim().slice(-256) || "Input requested (prompt text unavailable)" : "Input requested (prompt text unavailable)" };
+        } else if (event.type === "prompt" && Number.isSafeInteger(event.id) && Number.isFinite(event.lease) && event.lease >= 0 && event.lease <= 120) {
+          this.prompt = { id: event.id, deadline: Infinity, text: typeof event.text === "string" ? event.text.replace(/[^\x20-\x7e]/g, " ").trim().slice(-256) || "Input requested (prompt text unavailable)" : "Input requested (prompt text unavailable)" };
           this.status = "waiting-for-user";
           clearTimeout(this.promptTimer);
-          this.promptTimer = setTimeout(() => this.invalidate(), event.lease * 1000);
+
           this.updateWaiting();
           this.listener?.({ type: "prompt", id: event.id, lease: event.lease, text: this.prompt.text });
         } else if (event.type === "invalidate" || event.type === "submitted") this.invalidate();
@@ -95,19 +95,26 @@ export class ShellTask {
     this.updateWaiting();
     listener({ type: "output", text: this.output });
     // Reconnect never extends an existing generation's lease.
-    if (this.prompt && this.prompt.deadline > performance.now()) listener({ type: "prompt", id: this.prompt.id, lease: (this.prompt.deadline - performance.now()) / 1000, text: this.prompt.text });
+    if (this.prompt && this.prompt.deadline > performance.now()) listener({ type: "prompt", id: this.prompt.id, lease: 0, text: this.prompt.text });
     return true;
   }
   detach() {
     this.listener = undefined;
     this.updateWaiting();
   }
+  input(data: string) {
+    if (!this.listener || !this.active || this.stopping || terminal.has(this.status)) return;
+    for (const character of Array.from(data)) this.send({ type: "raw", value: character });
+  }
+  resize(columns: number, rows: number) {
+    if (this.active && !this.stopping) this.send({ type: "resize", columns, rows });
+  }
   manual() { if (this.active && !this.stopping && this.listener) this.send({ type: "manual" }); }
   submit(id: number, value: string) {
-    const prompt = this.prompt;
+    if (!this.listener || !this.active || this.stopping) return;
+    const promptId = this.prompt?.id ?? id;
     this.invalidate();
-    if (!this.listener || !this.active || this.stopping || !prompt || prompt.id !== id || prompt.deadline <= performance.now()) return;
-    this.send({ type: "input", id, value });
+    this.send({ type: "input", id: promptId, value });
   }
   private finish() {
     if (this.closed) return;

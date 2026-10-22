@@ -44,21 +44,17 @@ test("task limit, repeated stop, deadline, and shutdown reap active brokers", as
     assert(tasks.every(t => !t.active)); assert.deepEqual(registry.list(), []);
   } finally { await registry.shutdown(); }
 });
-test("background prompts never focus; attach preserves lease and stale generations cannot submit", async () => {
+test("background prompts survive idle time and only attached input reaches the PTY", async () => {
   const registry = new TaskRegistry();
   try {
-    const task = registry.start("stty -echo; printf 'Password: '; IFS= read -r -t 1 x; test -z \"$x\"", "/tmp", 3, 0.3)!;
-    for (let i = 0; i < 30 && task.status !== "waiting-for-user"; i++) await pause(20);
-    assert.equal(task.status, "waiting-for-user");
-    let id = 0, lease = 0;
-    assert(task.attach(event => { if (event.type === "prompt") { id = event.id!; lease = event.lease!; } }));
-    assert(id > 0); assert(lease <= 0.3);
-    assert.equal(task.attach(() => {}), false);
-    task.detach(); task.submit(id, "synthetic-only");
+    const task = registry.start("stty -echo; printf 'Password: '; read -r x; test \"$x\" = synthetic-only", "/tmp", 0, 0.1)!;
+    for (let i = 0; i < 100 && !task.pendingPrompt(); i++) await pause(10);
+    task.input("wrong\r");
     await pause(350);
-    task.attach(() => {}); task.submit(id, "synthetic-only");
+    assert(task.pendingPrompt());
+    task.attach(() => {}); task.input("synthetic-only\r");
     await task.done; assert.equal(task.status, "completed");
-    assert(task.read().includes("Password:"));
+    assert(!task.read().includes("synthetic-only"));
   } finally { await registry.shutdown(); }
 });
 
@@ -103,14 +99,14 @@ test("masked input is absent unless the command prints it; prompt waiting consum
   } finally { await registry.shutdown(); }
 });
 
-test("waiting lifecycle clears on invalidation, expiry, attachment, submission and stop", async () => {
+test("waiting lifecycle clears on output, attachment, submission and stop", async () => {
   const registry = new TaskRegistry();
   const transitions: boolean[] = [];
   try {
     const task = registry.start("stty -echo; printf 'Password: '; sleep .4; printf 'changed'; sleep .4; printf 'Password: '; sleep 10", "/tmp", 4, 0.3, (_task, waiting) => transitions.push(waiting))!;
     const wait = async (condition: () => boolean) => { for (let i = 0; i < 100 && !condition(); i++) await pause(20); assert(condition()); };
-    await wait(() => transitions.length >= 4);
-    assert.deepEqual(transitions.slice(0, 4), [true, false, true, false]);
+    await wait(() => transitions.length >= 3);
+    assert.deepEqual(transitions.slice(0, 3), [true, false, true]);
     task.attach(() => {}); task.manual();
     await pause(100);
     task.detach(); assert.equal(transitions.at(-1), true);

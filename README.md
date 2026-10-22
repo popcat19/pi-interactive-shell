@@ -1,6 +1,6 @@
 # pi-interactive-shell
 
-Approval-gated Linux PTY commands with local masked input and session-owned background tasks. **Command output is returned to the model.** There is no output-sharing policy, release step, or secret redaction.
+Linux PTY commands with direct local terminal input and session-owned background tasks. Commands launch immediately, with no y/n approval screen. Command output reaches the model and transcript; program-echoed credentials are not redacted.
 
 ## Load and commands
 
@@ -12,78 +12,48 @@ Requires Linux, Python 3, bash, and Pi's interactive TUI with TTY stdin and stdo
 
 | Command | Action |
 |---|---|
-| `/shell COMMAND` | Approve and run in the foreground |
-| `/shell-bg COMMAND` | Approve and start a background task |
+| `/shell COMMAND` | Run in the foreground |
+| `/shell-bg COMMAND` | Start a background task |
 | `/shell-tasks` | List session task IDs and status |
-| `/shell-attach ID` | Focus task output and masked input |
-| `/shell-stop ID` | Stop the task and await cleanup |
+| `/shell-attach ID` | Attach to an active task |
+| `/shell-stop ID` | Stop a task and await cleanup |
 
-`interactive_shell` takes `command`, optional `timeout` (1..3600 seconds), and optional `background` (default false). Foreground results return task metadata and the latest bounded sanitized output. Background calls return an ID immediately after approval. This confirms launch, not readiness or substantive progress. Live waiting task summaries include the program-provided prompt. `shell_task` takes `action` (`list`, `status`, `read`, `stop`) and `id` except for list. Status, read, and stop return latest output; list returns metadata. Tools cannot submit responses. Local commands display output through the task screen; reattach to browse completed output.
+`interactive_shell` accepts `command`, optional `timeout` (0..3600 seconds), and optional `background`. Zero or an omitted timeout disables the runtime deadline by default. `--interactive-shell-timeout` sets a default explicit deadline. Prompt input has no lease or AFK timeout; the old `--interactive-shell-lease` flag is accepted but ignored.
 
-Enable optional approval-gated agent bash only per launch:
+`--interactive-shell-bash` optionally routes agent bash calls through this PTY. Without it, stock bash is unchanged.
 
-```sh
-pi --extension ./src/extension.ts --interactive-shell-bash
-```
+## Terminal interaction
 
-Without that flag, stock bash is untouched. The replacement uses the same bounded-output and masked-input path.
+Input is available throughout an attached task, even without a detected prompt. Keystrokes go directly to the PTY. The program controls echo, including hiding passwords for SSH and `su`. Input is never automatically suffixed with a question mark. PTY carriage returns are removed from displayed output so ordinary newlines do not produce trailing question marks.
 
-## Actionable terminal controls
+- Esc stops the task and awaits cleanup.
+- Ctrl+] detaches without stopping. `/shell-attach ID` reconnects.
+- Ctrl+C and Ctrl+D pass through to the program for interrupt and EOF.
+- Enter, Tab, Backspace, arrow keys, Home, End, Delete, and Ctrl letter combinations pass through.
+- PgUp/PgDn browses retained output.
+- Terminal dimensions are sent to the child PTY when the screen renders at a new size.
 
-Approval asks `:: Run this command? [y/N]`. Enter, `n`, or Esc denies. The exact command is JSON-escaped to make controls inert and visible. The approval warns that command output reaches the model/transcript and echoed credentials are exposed. Review every page using Left/Right, then press `y` on the last page. Unrendered pages cannot be approved; resizing restarts review.
+Both successful and failed exits close the task screen automatically. There is no exit confirmation. Completed output is available through `shell_task` read/status calls.
 
-Task screens show task ID, running/completed state, or **Waiting for your input**. State remains readable without color; Pi semantic theme colors emphasize headings. Output is sanitized actual multiline text, not quoted JSON.
+SSH and `su` use the same interactive path. Prompt recognition supplies context and opens background tasks when input appears necessary; it never gates attached input. Automatic screens stay attached after a response so a login can proceed into its interactive shell. Only one screen owns input at a time. Detached prompt generations do not repeatedly reopen.
 
-- PgUp/PgDn browses retained output. Returning to the last page follows new output.
-- Enter submits a masked response once; Ctrl+U clears provisional input.
-- Ctrl+P requests a fresh manual prompt when automatic detection misses it or its lease expires.
-- Ctrl+D detaches without stopping the task; `/shell-attach ID` reconnects.
-- Esc or Ctrl+C stops a running task and waits for cleanup before its receipt returns.
-- Enter or Esc closes a completed screen; completed screens do not close on a timer.
+This is a bounded text view, not a full terminal emulator. Output controls are sanitized; full-screen applications, color rendering, and cursor-addressed screen layouts are unsupported. Actual remote SSH authentication and privileged `su` authentication require manual validation. Tests use local synthetic PTYs.
 
-Layouts are bounded by terminal height and width. Very small terminals show an enlarge-terminal instruction instead of accepting an unreadable approval. One screen can own interactive input at a time; competing requests return `busy`.
+## Ownership and output
 
-Background prompts automatically open local masked input when no shell approval/input screen is active. Multiple tasks queue in arrival order, one live generation per task. Ownership, lease, UI availability, and logging guards are checked again before focus. Expired generations and session replacement discard queued opens. Automatic input screens close only after explicit submission or a deliberate close/cancel action; no keys are submitted automatically. Unsolicited output, invalidation, expiry, or completion during a response clears provisional text and retains an inert input owner. Continued typing and Enter are ignored. Esc/Ctrl+D explicitly acknowledges and closes this neutral screen; Ctrl+P deliberately requests a fresh generation while the task remains active. New generations cannot silently replace an interrupted response, and no completion timer releases focus. Ctrl+D suppresses reopening that generation; a later prompt generation can open again. Use `/shell-attach ID` to return manually.
+Tasks belong to the current Pi session. Shutdown and session replacement stop active brokers and erase retained output. Stop terminates the PTY process group and reaps the shell child. Processes that create independent sessions are not guaranteed cleanup. No durable services or cross-process reconnects are supported.
 
-A once-per-task warning and persistent status show a bounded, sanitized program-provided request, such as `[sudo] password for synthetic-user:`; no command identity is inferred. The same live context appears in task summaries and attached input. Context is at most 256 ASCII characters from the current output line, cleared between generations. Echo-off without recognizable text and manual input show `Input requested (prompt text unavailable)`. Responses are never directly copied into the prompt cache; commands that echo responses still expose output and can produce misleading prompt text. Status hints clear on invalidation, expiry, submission, attachment, stop, and completion. Runtime timeout continues while prompts wait in the queue.
+At most eight tasks run concurrently. History retains sixteen tasks; completed output expires after ten minutes. Each task retains the latest 16384 sanitized characters. Background calls return a launch receipt, not proof of readiness. `shell_task` supports list, status, read, and stop; it cannot submit terminal input.
 
-## Timeouts and ownership
+Background, detached, and local-command tasks publish one completion message containing status, exit code, and bounded output. Foreground tool calls return their terminal result without a duplicate message. Completion delivery waits while another shell screen owns focus. Session replacement discards pending reports.
 
-**Runtime timeout includes time waiting for human input**, including background authentication. Default runtime remains 300 seconds; `--interactive-shell-timeout` and per-call `timeout` accept 1..3600 seconds. A timeout alone does not establish why a particular output file was missing; inspect returned output and exit status.
-
-Prompt leases remain 30 seconds by default; `--interactive-shell-lease` accepts 1..120 seconds. Reattach preserves the remaining lease. Output, termios changes, expiry, submission, stop, and exit invalidate provisional input. There is no retry, resubmission, or credential caching. Approval expires after 60 seconds.
-
-At most 8 tasks run concurrently. History retains at most 16 tasks, evicting completed tasks first. Completed output expires after 10 minutes, swept every second. Logs retain only the last 16384 ASCII-sanitized characters per task in memory. Protocol parsing and pending writes are bounded. No complete log file is created.
-
-Session shutdown, reload, replacement, and fork clear ownership and retained task output. Stop terminates the broker, which terminates the PTY process group and reaps its shell child. The broker watchdog escalates after 1.5 seconds; the run watchdog acts 2 seconds after the broker deadline. Protected fork ownership and Linux parent-death signaling cover normal cancellation and abrupt Pi exit.
-
-No durable services, restarts, or cross-process reconnects are supported. Descendants that detach into another process group/session are **not guaranteed cleanup**. Commands can escape process-group containment; use an OS sandbox for stronger guarantees.
-
-## Input security and limits
-
-Never put credentials in command arguments or chat. Responses go from local masked input through a pipe to the broker and PTY, not directly into model results, session messages, argv, env, or files. Commands inherit the usual environment. **If the program echoes or prints a response, that output reaches the model and session transcript.** Masking is not redaction.
-
-Other extensions, process memory, terminal scrollback, command-written files, and external recordings are outside this protection. Known Pi logging env vars (`PI_TUI_WRITE_LOG`, `PI_TUI_DEBUG`, `PI_TUI_DEBUG_REDRAW`) block interactive screens. The global Shift+Ctrl+D debug callback is suppressed during approval and input screens, then restored safely. This does not disable preconfigured loggers with removed env vars, crash dumps, other input listeners, or external recording.
-
-Linux cannot universally prove a process is blocked reading `/dev/tty`; shell timed-read races remain best effort. Prompt detection uses termios and bounded text cues; arbitrary applications can require Ctrl+P. Actual sudo/doas, SSH, SFTP, and systemd integrations remain unvalidated. GUI polkit and full-screen applications are unsupported.
+Known Pi debug logging environment variables block interactive screens. The global debug callback is suppressed during task focus and restored afterward. Program output, terminal recording, other extensions, and process memory remain outside input privacy guarantees. Never place credentials in command arguments or chat.
 
 ## Validation
 
-With installed pinned dev dependencies:
-
 ```sh
-npm test
 npm run typecheck
+npm test
 ```
 
-Tests use synthetic responses and local commands, with no privileged or network authentication. They cover visible output by default, command echo behavior, background prompt detection and timeout, masked input, task lifecycle, approval rendering, bounded layout/paging, and actual Pi TUI debug dispatch with a synthetic terminal. Physical-terminal appearance, screen-reader behavior, and key delivery still need manual validation.
-
-SDK dev dependencies remain pinned to 0.87.1. The existing unresolved `brace-expansion@5.0.9` advisory comes from its published shrinkwrap. This change does not alter dependencies or the lockfile, install itself, modify settings, or publish.
-
-## Completion in the conversation
-
-Background tasks, foreground tasks detached before completion, and local `/shell` or `/shell-bg` runs publish one displayed, model-visible `shell-completion` message with task ID, terminal status, exit code (null when unavailable), and the same last 16384 sanitized output characters. Success, nonzero exit, timeout, and explicit cancellation all report. The message requests an agent continuation through Pi's `triggerTurn: true` with `deliverAs: "followUp"`, not steering an in-flight response.
-
-Delivery waits while any shell approval/input screen owns focus, including an interrupted inert response. Dismiss or acknowledge that screen to release the completion; no screen mounted means completion publishes when the broker closes. No automatic focus dismissal was added. A foreground agent tool that returns a terminal result uses that result alone, without a duplicate completion message. Task read/status/stop calls do not create extra completion messages.
-
-Session replacement and shutdown discard pending reports and suppress cancellation continuations for the old session. Completion markers are in-memory and removed on delivery/reset. The void SDK send API provides no persistence acknowledgement; this extension makes one dispatch attempt and does not retry a failed host delivery, avoiding duplicate messages. Command-echoed credentials remain visible output; response buffers are never copied into completion messages or details.
+Tests cover local PTY input without prompts, password echo behavior, task cleanup, output bounds, explicit deadlines, immediate launch, automatic exit, detach, background completion, screen controls, and resize dispatch. Physical-terminal rendering, real SSH/su authentication, and accessibility need manual validation.

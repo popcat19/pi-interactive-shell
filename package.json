@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Approval-gated private Linux PTY prompts for Pi",
+  "description": "Interactive Linux PTY tasks with direct local input for Pi",
   "keywords": ["pi-package"],
   "pi": { "extensions": ["./src/extension.ts"] },
   "peerDependencies": {

@@ -60,6 +60,19 @@ class BrokerTests(unittest.TestCase):
         c.send({"type": "input", "id": second["id"], "value": "synthetic-only"})
         self.assertEqual(c.event("done")["status"], "completed")
 
+    def test_raw_input_works_without_prompt_cue(self):
+        c = self.client("IFS= read -r value; test \"$value\" = synthetic-only; printf accepted")
+        c.send({"type": "raw", "value": "synthetic-only"})
+        c.send({"type": "raw", "value": "\n"})
+        self.assertEqual(c.event("done")["status"], "completed")
+        self.assertIn("accepted", "".join(e.get("text", "") for e in c.events))
+
+    def test_raw_terminal_controls_and_resize(self):
+        c = self.client("stty -echo; IFS= read -r value; test \"$value\" = synthetic-only; printf 'accepted\\n'")
+        c.send({"type": "resize", "columns": 132, "rows": 43})
+        c.send({"type": "raw", "value": "synthetic-only\r"})
+        self.assertEqual(c.event("done")["status"], "completed")
+
     def test_exit_codes(self):
         for command, code in [("exit 0", 0), ("exit 42", 42), ("kill -TERM $$", -15)]:
             with self.subTest(command=command):

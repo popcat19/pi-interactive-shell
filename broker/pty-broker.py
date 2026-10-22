@@ -1,6 +1,8 @@
 # Purpose: Mediate a private Linux PTY through bounded, generation-checked pipe messages.
 import codecs
 import ctypes
+import fcntl
+import struct
 import json
 import os
 import re
@@ -20,7 +22,7 @@ def emit(event):
 
 
 def safe(text):
-    return "".join(c if c == "\n" or 32 <= ord(c) < 127 else "?" for c in text)
+    return "".join(c if c == "\n" or 32 <= ord(c) < 127 else " " for c in text if c != "\r")
 
 
 class Broker:
@@ -59,10 +61,10 @@ class Broker:
     def prompt(self, manual=False):
         self.invalidate()
         self.serial += 1
-        self.active = (self.serial, time.monotonic() + self.config["lease"], self.attrs())
+        self.active = (self.serial, float("inf"), self.attrs())
         text = self.tail.rstrip().split("\n")[-1].strip()
         text = text[-256:] if not manual and CUE.search(text) else "Input requested (prompt text unavailable)"
-        emit({"type": "prompt", "id": self.serial, "lease": self.config["lease"], "text": text})
+        emit({"type": "prompt", "id": self.serial, "lease": 0, "text": text})
         self.pending_cue = False
         self.tail = ""
 
@@ -89,20 +91,26 @@ class Broker:
         if kind == "cancel":
             self.status = "cancelled"
             return False
-        if kind == "manual":
+        if kind == "resize":
+            rows, columns = message.get("rows"), message.get("columns")
+            if isinstance(rows, int) and isinstance(columns, int) and 1 <= rows <= 65535 and 1 <= columns <= 65535:
+                fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
+        elif kind == "raw":
+            value = message.get("value")
+            if isinstance(value, str) and len(value.encode("utf-8")) <= 4096:
+                os.write(self.fd, value.encode("utf-8"))
+        elif kind == "manual":
             self.drain()
             self.prompt(manual=True)
         elif kind == "input":
             self.drain()
             active = self.active
             self.invalidate()
-            value = message.get("value", "")
-            if not active or message.get("id") != active[0] or time.monotonic() >= active[1]:
+            if not active or message.get("id") != active[0]:
                 return True
+            value = message.get("value", "")
             if not self.alive():
                 return False
-            if self.attrs() != active[2] or select.select([self.fd], [], [], 0)[0]:
-                return True
             if not isinstance(value, str) or len(value.encode("utf-8")) > 1024 or any(ord(c) < 32 or ord(c) == 127 for c in value):
                 return True
             # This narrows a race, but cannot prove a program is blocked in read().
@@ -154,7 +162,7 @@ class Broker:
                 except BaseException:
                     os._exit(127)
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-            deadline = time.monotonic() + self.config["timeout"]
+            deadline = time.monotonic() + self.config["timeout"] if self.config["timeout"] else float("inf")
             os.set_blocking(self.fd, False)
             while True:
                 if not self.alive():
@@ -167,7 +175,7 @@ class Broker:
                 self.drain()
                 attrs = self.attrs()
                 echo = bool(attrs[3] & termios.ECHO)
-                if self.active and (now >= self.active[1] or attrs != self.active[2]):
+                if self.active and attrs != self.active[2]:
                     self.invalidate()
                 if echo != self.echo:
                     self.invalidate()
@@ -212,7 +220,7 @@ def main():
                 raise ValueError()
             line += chunk
         config = json.loads(line)
-        if not 0.1 <= config["timeout"] <= 3600 or not 0.1 <= config["lease"] <= 120:
+        if not 0 <= config["timeout"] <= 3600 or not 0 <= config["lease"] <= 120:
             raise ValueError()
         if not isinstance(config["command"], str) or len(config["command"]) > 8192:
             raise ValueError()

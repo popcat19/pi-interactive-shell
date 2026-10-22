@@ -1,555 +1,89 @@
-// Purpose: Check registration, opt-in routing, and fail-closed behavior without credentials.
+// Purpose: Verify immediate launch, automatic completion, input passthrough, and session cleanup.
 import assert from "node:assert/strict";
 import test from "node:test";
 import extension from "../src/extension.ts";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ShellScreen } from "../src/shell-screen.ts";
 
-function fixture(enabled = false) {
-  const tools = new Map<string, ToolDefinition>();
-  const handlers = new Map<string, () => void | Promise<void>>();
-  const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
-  const flags = new Map<string, string | boolean>();
-  const messages: { message: Parameters<ExtensionAPI["sendMessage"]>[0]; options: Parameters<ExtensionAPI["sendMessage"]>[1] }[] = [];
-  const api = {
-    sendMessage(message: Parameters<ExtensionAPI["sendMessage"]>[0], options: Parameters<ExtensionAPI["sendMessage"]>[1]) { messages.push({ message, options }); },
-    registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
-    registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) { commands.set(name, command); },
-    registerFlag(name: string, options: { default: string | boolean }) { flags.set(name, options.default); },
-    getFlag(name: string) { return flags.get(name); },
-    on(name: string, handler: () => void) { handlers.set(name, handler); },
-  } as unknown as ExtensionAPI;
-  extension(api);
-  flags.set("interactive-shell-bash", enabled);
-  handlers.get("session_start")!();
-  return { tools, handlers, commands, flags, messages };
+const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+async function wait(condition: () => boolean) {
+  for (let i = 0; i < 300 && !condition(); i++) await pause(10);
+  assert(condition());
 }
 
-test("disabled integration registers no bash override", () => {
-  assert.equal(fixture().tools.has("bash"), false);
-});
-test("opt-in integration replaces bash and never calls stock execute outside TUI", async () => {
-  const { tools } = fixture(true);
-  for (const name of ["bash", "interactive_shell"]) {
-    let updates = 0;
-    const result = await tools.get(name)!.execute("test", { command: "printf synthetic-output" }, undefined, () => { updates++; }, { mode: "rpc", hasUI: true } as ExtensionContext);
-    assert.equal(updates, 0);
-    assert.deepEqual(result, { content: [{ type: "text", text: "Shell status: unavailable." }], details: undefined });
-  }
-});
-
-test("background output is returned without policy choices; simplified commands and shutdown", async () => {
-  const stdin = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
-  const stdout = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-  const f = fixture();
-  const previews: string[] = [];
-  let approve = true, updates = 0;
+function fixture() {
+  const tools = new Map<string, ToolDefinition>(), handlers = new Map<string, () => Promise<void>>();
+  const flags = new Map<string, unknown>(), messages: unknown[] = [];
+  let screen: ShellScreen | undefined, mounts = 0;
+  const debug = () => {};
+  const tui = { onDebug: debug, requestRender() {}, terminal: { columns: 100, rows: 40 } };
+  extension({
+    registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); }, registerCommand() {},
+    registerFlag(name: string, options: { default: unknown }) { flags.set(name, options.default); },
+    getFlag(name: string) { return flags.get(name); },
+    on(name: string, handler: () => Promise<void>) { handlers.set(name, handler); },
+    sendMessage(message: unknown) { messages.push(message); },
+  } as unknown as ExtensionAPI);
   const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: {
-    notify() {},
-    custom: async (factory: Function) => new Promise(resolve => {
-      const screen = factory({ requestRender() {}, terminal: { columns: 1000 } }, {}, {}, resolve);
-      previews.push(screen.render(1000).join("\n"));
-      screen.handleInput(approve ? "y" : "\x1b");
-    }),
+    notify() {}, setStatus() {},
+    custom(factory: Function) { return new Promise(resolve => {
+      screen = factory(tui, {}, {}, resolve); mounts++; screen!.render(100);
+    }); },
   } } as unknown as ExtensionContext;
-  const call = (name: string, args: object) => f.tools.get(name)!.execute("test", args, undefined, () => { updates++; }, ctx);
-  const query = async (id: string, action = "read") => JSON.stringify(await call("shell_task", { id, action }));
-  const waitDone = async (id: string) => {
-    for (let i = 0; i < 100; i++) {
-      const value = await query(id, "status");
-      if (value.includes("completed")) return;
-      await new Promise(r => setTimeout(r, 20));
-    }
-    assert.fail("task did not complete");
-  };
-  try {
-    const receipt = await call("interactive_shell", { command: "printf synthetic-only", background: true });
-    assert.equal(receipt.details, undefined);
-    assert(!JSON.stringify(receipt).includes("synthetic-only"));
-    const id = JSON.parse((receipt.content[0] as { text: string }).text.split("\n")[0]).id;
-    await waitDone(id);
-    for (const action of ["status", "read", "stop"]) assert((await query(id, action)).includes("synthetic-only"));
-    assert(!JSON.stringify(f.tools.get("interactive_shell")!.parameters).includes('"output"'));
-    assert.deepEqual([...f.commands.keys()].sort(), ["shell", "shell-attach", "shell-bg", "shell-stop", "shell-tasks"]);
-    assert(previews[0].includes("Echoed credentials are exposed"));
-    assert.equal(updates, 0);
-    await f.handlers.get("session_shutdown")!();
-    assert((await query(id)).includes("not-found"));
-  } finally {
-    await f.handlers.get("session_shutdown")!();
-    if (stdin) Object.defineProperty(process.stdin, "isTTY", stdin); else Reflect.deleteProperty(process.stdin, "isTTY");
-    if (stdout) Object.defineProperty(process.stdout, "isTTY", stdout); else Reflect.deleteProperty(process.stdout, "isTTY");
-  }
-});
+  const execute = (command: string, background = false, signal?: AbortSignal, timeout?: number) => tools.get("interactive_shell")!.execute("test", { command, background, timeout }, signal, undefined, ctx);
+  return { tools, handlers, flags, messages, execute, ctx, tui, debug, screen: () => screen!, mounts: () => mounts };
+}
 
-test("competing approvals fail busy; approval exceptions and session reset do not leak private data", async () => {
-  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+test("non-TUI calls remain unavailable", async () => {
   const f = fixture();
-  let finish: ((value: boolean) => void) | undefined;
-  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { custom: (factory: Function) => new Promise(resolve => {
-    finish = resolve;
-    factory({ requestRender() {}, terminal: { columns: 1000 } }, {}, {}, resolve);
-  }) } } as unknown as ExtensionContext;
-  const execute = () => f.tools.get("interactive_shell")!.execute("test", { command: "printf synthetic-only", background: true }, undefined, undefined, ctx);
-  try {
-    const pending = execute();
-    assert(JSON.stringify(await execute()).includes("busy"));
-    await f.handlers.get("session_start")!();
-    finish?.(true);
-    const denied = await pending;
-    assert(!JSON.stringify(denied).includes("synthetic-only"));
-    ctx.ui.custom = async () => { throw new Error("synthetic-only"); };
-    const error = await execute();
-    assert(JSON.stringify(error).includes("error"));
-    assert(!JSON.stringify(error).includes("synthetic-only"));
-  } finally {
-    await f.handlers.get("session_shutdown")!();
-    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
-    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
-  }
+  const result = await f.tools.get("interactive_shell")!.execute("t", { command: "true" }, undefined, undefined, { mode: "rpc", hasUI: true } as ExtensionContext);
+  assert(JSON.stringify(result).includes("unavailable"));
+  assert(!f.tools.has("bash"));
 });
 
-test("real Pi TUI input suppresses debug across approval and focus; cancel awaits cleanup", async () => {
-  const { TuiMainScreen } = await import("@earendil-works/pi-tui");
-  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-  const f = fixture(true);
-  let terminalInput!: (data: string) => void;
-  const terminal = { columns: 1000, rows: 100, kittyProtocolActive: false,
-    start(callback: (data: string) => void) { terminalInput = callback; }, stop() {}, async drainInput() {}, write() {}, moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
-  };
-  const tui = new TuiMainScreen(terminal);
-  const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
-  const { tmpdir } = await import("node:os");
-  const directory = mkdtempSync(`${tmpdir()}/pi-shell-debug-test-`);
-  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = directory;
-  const sdkRoot = new URL("../node_modules/@earendil-works/pi-coding-agent/dist/", import.meta.url);
-  const { InteractiveMode } = await import(new URL("modes/interactive/interactive-mode.js", sdkRoot).href);
-  const { initTheme } = await import(new URL("modes/interactive/theme/theme.js", sdkRoot).href);
-  const { getDebugLogPath } = await import(new URL("config.js", sdkRoot).href);
-  const oldPackageDir = process.env.PI_PACKAGE_DIR;
-  process.env.PI_PACKAGE_DIR = new URL("../", sdkRoot).pathname;
-  try { initTheme("dark", false); } finally { if (oldPackageDir === undefined) delete process.env.PI_PACKAGE_DIR; else process.env.PI_PACKAGE_DIR = oldPackageDir; }
-  const captures: string[] = [];
-  const debug = () => {
-    InteractiveMode.prototype.handleDebugCommand.call({ ui: tui, session: { messages: [] }, chatContainer: { addChild() {} } });
-    captures.push(readFileSync(getDebugLogPath(), "utf8"));
-  };
-  tui.onDebug = debug;
-  tui.start();
-  let screen: import("../src/shell-screen.ts").ShellScreen | undefined;
-  let mount = 0;
-  const notices: string[] = [];
-  const statuses: string[] = [];
-  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { notify(text: string) { notices.push(text); }, setStatus(_key: string, text: string) { if (text) statuses.push(text); }, custom: (factory: Function) => new Promise(resolve => {
-    screen = factory(tui, {}, {}, (value: unknown) => { tui.clear(); tui.setFocus(null); screen?.dispose(); resolve(value); });
-    tui.addChild(screen!); tui.setFocus(screen!); mount++;
-  }) } } as unknown as ExtensionContext;
-  const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
-  const wait = async (condition: () => boolean) => { for (let i = 0; i < 200 && !condition(); i++) await pause(10); assert(condition()); };
-  const hitDebug = () => { const count = captures.length; terminalInput("\x1b[100;6u"); assert.equal(captures.length, count); };
-  const execute = (command: string, signal?: AbortSignal, background = false) => f.tools.get("interactive_shell")!.execute("t", { command, background }, signal, undefined, ctx);
-  const approve = () => { tui.render(1000); hitDebug(); terminalInput("y"); };
-  const idOf = (r: Awaited<ReturnType<typeof execute>>) => JSON.parse((r.content[0] as { text: string }).text.split("\n")[0]).id;
+test("interactive lifecycle launches without approval and closes without confirmation", async () => {
+  const descriptors = [process.stdin, process.stdout].map(stream => Object.getOwnPropertyDescriptor(stream, "isTTY"));
+  for (const stream of [process.stdin, process.stdout]) Object.defineProperty(stream, "isTTY", { value: true, configurable: true });
+  const f = fixture();
   try {
-    terminalInput("\x1b[100;6u"); assert.equal(captures.length, 1);
-    let run = execute("printf '%s\\n' $$; sleep 30");
-    approve(); await wait(() => mount === 2);
-    await wait(() => /[0-9]+\?/.test(screen!.render(1000).join("\n")));
-    const rendered = screen!.render(1000).join("\n");
-    const pid = Number(rendered.match(/([0-9]+)\?/)![1]);
-    hitDebug(); terminalInput("\x1b");
-    const cancelled = await run;
-    assert(JSON.stringify(cancelled).includes("cancelled"));
-    assert.throws(() => process.kill(pid, 0));
-    assert.equal(tui.onDebug, debug);
-
-    for (const name of ["interactive_shell", "bash"]) {
-      const beforeOutput = mount;
-      const normal = f.tools.get(name)!.execute("o", { command: "printf synthetic-output" }, undefined, undefined, ctx);
-      approve(); await wait(() => mount === beforeOutput + 2);
-      await wait(() => screen!.render(1000).join("\n").includes("completed"));
-      terminalInput("\r");
-      assert(JSON.stringify(await normal).includes("synthetic-output"));
+    await f.handlers.get("session_start")!();
+    assert.equal(f.flags.get("interactive-shell-timeout"), "0");
+    for (const code of [0, 7]) {
+      const before = f.mounts();
+      const result = await f.execute(`printf 'output\\n'; exit ${code}`);
+      assert.equal(f.mounts(), before + 1);
+      assert(JSON.stringify(result).includes(`\\"exitCode\\":${code}`));
+      assert(!JSON.stringify(result).includes("output?"));
+      assert.equal(f.messages.length, 0);
+      assert.equal(f.tui.onDebug, f.debug);
     }
-    const local = f.commands.get("shell")!.handler("printf local-output", ctx);
-    const localMount = mount;
-    approve(); await wait(() => mount === localMount + 1);
-    await wait(() => screen!.render(1000).join("\n").includes("completed"));
-    assert(screen!.render(1000).join("\n").includes("local-output"));
-    terminalInput("\r"); await local;
-
+    const run = f.execute("stty -echo; printf 'Password: '; read -r x; test \"$x\" = synthetic-only");
+    await wait(() => f.screen().render(100).join("\n").includes("Password:"));
+    f.screen().handleInput("synthetic-only"); f.screen().handleInput("\r");
+    const result = await run;
+    assert(JSON.stringify(result).includes("completed")); assert(!JSON.stringify(result).includes("synthetic-only"));
+    const cancelled = f.execute("sleep 30");
+    assert(JSON.stringify(await f.execute("true")).includes("busy"));
+    f.screen().handleInput("\x1b");
+    assert(JSON.stringify(await cancelled).includes("cancelled"));
     const controller = new AbortController();
-    const before = mount;
-    run = execute("sleep 30", controller.signal); approve(); await wait(() => mount === before + 2);
-    controller.abort(); assert(JSON.stringify(await run).includes("cancelled")); assert.equal(tui.onDebug, debug);
-
-    const promptCommand = "stty -echo; printf 'Password: '; IFS= read -r x; test \"$x\" = synthetic-only";
-    run = execute(promptCommand); approve(); await wait(() => screen!.render(1000).join("\n").includes("Response "));
-    hitDebug(); terminalInput("\x04"); const firstId = idOf(await run);
-    assert.equal(tui.onDebug, debug);
-    run = execute(promptCommand, undefined, true); approve(); const secondId = idOf(await run);
-    await pause(250);
-    assert(notices.some(text => text.includes(secondId) && text.includes("Waiting for your input")));
-    assert(statuses.some(text => text.includes(secondId)));
-    const listed = await f.tools.get("shell_task")!.execute("t", { action: "list" }, undefined, undefined, ctx);
-    assert.equal((JSON.stringify(listed).match(/waiting-for-user/g) ?? []).length, 2);
-    terminalInput("\x04"); await pause(20);
-    for (const id of [firstId, secondId]) {
-      const attached = f.commands.get("shell-attach")!.handler(id, ctx);
-      const text = screen!.render(1000).join("\n");
-      assert(text.includes(id)); assert(text.includes("Waiting for your input"));
-      hitDebug(); terminalInput("synthetic-only"); terminalInput("\r");
-      await wait(() => screen!.render(1000).join("\n").includes("completed"));
-      terminalInput("\r"); await attached; assert.equal(tui.onDebug, debug);
-      const read = await f.tools.get("shell_task")!.execute("r", { action: "read", id }, undefined, undefined, ctx);
-      assert(!JSON.stringify(read).includes("synthetic-only"));
-      assert(JSON.stringify(read).includes("Password:"));
-    }
-    assert.equal(tui.onDebug, debug);
-    assert.equal(captures.length, 1);
-    assert.equal(readFileSync(getDebugLogPath(), "utf8"), captures[0]);
-    const old = process.env.PI_TUI_WRITE_LOG;
-    process.env.PI_TUI_WRITE_LOG = "synthetic-blocked";
-    try { assert(JSON.stringify(await execute("true")).includes("logging-blocked")); }
-    finally { if (old === undefined) delete process.env.PI_TUI_WRITE_LOG; else process.env.PI_TUI_WRITE_LOG = old; }
-  } finally {
-    await f.handlers.get("session_shutdown")!(); tui.stop();
-    if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
-    rmSync(directory, { recursive: true, force: true });
-    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
-    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
-  }
-});
-
-test("repeated detached prompts notify once and clear persistent hints on expiry and output", async () => {
-  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-  const f = fixture(); f.flags.set("interactive-shell-lease", "1");
-  const notices: string[] = [], changes: (string | undefined)[] = [];
-  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: {
-    notify(text: string) { notices.push(text); },
-    setStatus(_key: string, text: string | undefined) { changes.push(text); },
-    custom: (factory: Function) => new Promise(resolve => {
-      const screen = factory({ requestRender() {}, terminal: { columns: 1000, rows: 100 } }, {}, {}, resolve);
-      screen.render(1000); screen.handleInput("y");
-      if (screen.render(1000).join("\n").includes("Waiting for your input")) screen.handleInput("\x04");
-    }),
-  } } as unknown as ExtensionContext;
-  try {
-    const receipt = await f.tools.get("interactive_shell")!.execute("t", { command: "stty -echo; printf 'Password: '; sleep 1.5; printf 'Password: '; sleep .4; printf changed; sleep 2", background: true }, undefined, undefined, ctx);
-    const id = JSON.parse((receipt.content[0] as { text: string }).text.split("\n")[0]).id;
-    for (let i = 0; i < 150 && changes.length < 4; i++) await new Promise(r => setTimeout(r, 20));
-    assert.deepEqual(changes.slice(0, 4).map(Boolean), [true, false, true, false]);
-    assert.equal(notices.length, 1);
-    assert(notices[0].includes(id));
-    await f.tools.get("shell_task")!.execute("s", { action: "stop", id }, undefined, undefined, ctx);
-    assert.equal(changes.at(-1), undefined); assert.equal(notices.length, 1);
+    const aborted = f.execute("sleep 30", false, controller.signal); controller.abort();
+    assert(JSON.stringify(await aborted).includes("cancelled"));
+    const detached = f.execute("sleep .2; printf detached"); f.screen().handleInput("\x1d"); await detached;
+    await wait(() => f.messages.length === 1);
+    await f.execute("printf background", true);
+    await wait(() => f.messages.length === 2);
+    assert(JSON.stringify(f.messages).includes("background"));
+    const timed = await f.execute("sleep 30", false, undefined, 0.2);
+    assert(JSON.stringify(timed).includes("timeout"));
+    const prior = process.env.PI_TUI_WRITE_LOG;
+    process.env.PI_TUI_WRITE_LOG = "blocked";
+    try { assert(JSON.stringify(await f.execute("true")).includes("logging-blocked")); }
+    finally { if (prior === undefined) delete process.env.PI_TUI_WRITE_LOG; else process.env.PI_TUI_WRITE_LOG = prior; }
   } finally {
     await f.handlers.get("session_shutdown")!();
-    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
-    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
-  }
-});
-
-test("automatic prompts queue behind approval, serialize, avoid detach loops, expire and reset", async () => {
-  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-  const f = fixture();
-  let screen!: import("../src/shell-screen.ts").ShellScreen;
-  let mounts = 0;
-  const notices: string[] = [];
-  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { notify(text: string) { notices.push(text); }, setStatus() {}, custom: (factory: Function) => new Promise(resolve => {
-    screen = factory({ requestRender() {}, terminal: { columns: 100, rows: 40 } }, {}, {}, (value: unknown) => resolve(value));
-    mounts++;
-  }) } } as unknown as ExtensionContext;
-  const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
-  const wait = async (condition: () => boolean) => { for (let i = 0; i < 200 && !condition(); i++) await pause(10); assert(condition()); };
-  const launch = () => f.tools.get("interactive_shell")!.execute("t", { command: "sleep .3; stty -echo; printf '[sudo] password for synthetic-user: '; read -r x; sleep .3; printf 'Next password: '; read -r x", background: true }, undefined, undefined, ctx);
-  const approve = () => { screen.render(100); screen.handleInput("y"); };
-  try {
-    let receipt = launch(); approve(); await receipt;
-    const second = launch();
-    await pause(650);
-    assert.equal(mounts, 2); // Approval holds focus while first prompt queues.
-    approve(); await second; await wait(() => mounts === 3);
-    assert(screen.render(100).join("\n").includes("[sudo] password for synthetic-user:"));
-    assert(notices[0].includes("[sudo] password for synthetic-user:"));
-    await pause(600); assert.equal(mounts, 3);
-    screen.handleInput("\x04"); await wait(() => mounts === 4);
-    screen.handleInput("\x04"); await pause(100); assert.equal(mounts, 4);
-    // Both live generations were detached, so neither reopens.
-    const list = await f.tools.get("shell_task")!.execute("l", { action: "list" }, undefined, undefined, ctx);
-    const tasks = JSON.parse((list.content[0] as { text: string }).text);
-    assert.equal(tasks.length, 2); assert(tasks.every((t: { prompt: string }) => t.prompt.includes("[sudo]")));
-    const attached = f.commands.get("shell-attach")!.handler(tasks[0].id, ctx);
-    screen.render(100); screen.handleInput("synthetic-only"); screen.handleInput("\r");
-    screen.handleInput("\x04"); await attached;
-    const beforeNext = mounts;
-    await wait(() => mounts > beforeNext);
-    assert(screen.render(100).join("\n").includes("Next password:"));
-    screen.handleInput("\x04"); await pause(30);
-    await f.handlers.get("session_start")!();
-    f.flags.set("interactive-shell-lease", "1");
-    receipt = launch(); approve(); await receipt;
-    const blocker = launch();
-    await pause(1600); const beforeExpiry = mounts;
-    screen.handleInput("\x1b"); await blocker; await pause(100);
-    assert.equal(mounts, beforeExpiry); // Expired queued generation must not focus.
-    await f.handlers.get("session_start")!();
-    receipt = launch(); approve(); await receipt;
-    const switching = launch(); await pause(650);
-    const beforeSwitch = mounts;
-    await f.handlers.get("session_start")!(); await switching; await pause(100);
-    assert.equal(mounts, beforeSwitch);
-  } finally {
-    await f.handlers.get("session_shutdown")!();
-    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
-    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
-  }
-});
-
-test("actual dispatcher retains interrupted input against editor and queued task, including old timer horizon", async () => {
-  const { TuiMainScreen } = await import("@earendil-works/pi-tui");
-  const { TaskRegistry } = await import("../src/task-registry.ts");
-  type Task = import("../src/task-registry.ts").ShellTask;
-  const originalStart = TaskRegistry.prototype.start;
-  const tasks: Task[] = [];
-  TaskRegistry.prototype.start = function (...args) { const task = originalStart.apply(this, args); if (task) tasks.push(task); return task; };
-  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-  const f = fixture();
-  let dispatch!: (data: string) => void;
-  const tui = new TuiMainScreen({ columns: 100, rows: 40, kittyProtocolActive: false,
-    start(callback: (data: string) => void) { dispatch = callback; }, stop() {}, async drainInput() {}, write() {}, moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {}, clearScreen() {}, setTitle() {}, setProgress() {},
-  });
-  const editorInput: string[] = [];
-  const editor = { render: () => ["sentinel editor"], invalidate() {}, handleInput: (data: string) => editorInput.push(data) };
-  let screen!: import("../src/shell-screen.ts").ShellScreen;
-  let mounts = 0;
-  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { notify() {}, setStatus() {}, custom: (factory: Function) => new Promise(resolve => {
-    screen = factory(tui, {}, {}, (value: unknown) => { tui.clear(); tui.addChild(editor); tui.setFocus(editor); screen.dispose(); resolve(value); });
-    tui.clear(); tui.addChild(screen); tui.setFocus(screen); mounts++;
-  }) } } as unknown as ExtensionContext;
-  tui.start();
-  const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
-  const frame = (task: Task, ...events: object[]) => (task as unknown as { receive(data: string): void }).receive(events.map(e => JSON.stringify(e)).join("\n") + "\n");
-  const prompt = (id: number) => ({ type: "prompt", id, lease: 60, text: `Synthetic request ${id}:` });
-  const launch = async () => {
-    const receipt = f.tools.get("interactive_shell")!.execute("t", { command: "sleep 30", background: true }, undefined, undefined, ctx);
-    tui.render(100); dispatch("y"); await receipt;
-  };
-  try {
-    await launch(); await launch();
-    const [first, second] = tasks;
-    const sent: object[] = [];
-    (first as unknown as { send(message: object): void }).send = message => sent.push(message);
-    frame(first, prompt(1)); await pause(10);
-    frame(second, prompt(1)); await pause(10);
-    const owner = screen, initialMounts = mounts;
-    dispatch("synthetic-prefix");
-    frame(first, { type: "invalidate" }, { type: "output", text: "changed" }, prompt(2));
-    dispatch("synthetic-suffix"); dispatch("\r");
-    assert.equal(screen, owner); assert.equal(mounts, initialMounts);
-    assert.deepEqual(editorInput, []); assert.deepEqual(sent, []);
-    assert(screen.render(100).join("\n").includes("Input interrupted"));
-    // A deliberate manual refresh accepts adjacent invalidate/prompt frames in this owner.
-    first.manual = () => frame(first, { type: "invalidate" }, prompt(3));
-    dispatch("\x10");
-    assert(screen.render(100).join("\n").includes("Synthetic request 3:"));
-    dispatch("synthetic-valid"); dispatch("\r");
-    assert(sent.some(m => JSON.stringify(m).includes('"value":"synthetic-valid"')));
-    await pause(10);
-    assert(screen.render(100).join("\n").includes(second.id));
-    const secondOwner = screen;
-    dispatch("synthetic-prefix");
-    frame(second, { type: "invalidate" }, { type: "done", status: "completed", exitCode: 0 });
-    dispatch("synthetic-suffix"); dispatch("\r");
-    await pause(10100);
-    dispatch("synthetic-after-timer"); dispatch("\r");
-    assert.equal(screen, secondOwner); assert.deepEqual(editorInput, []);
-    assert(screen.render(100).join("\n").includes("Input interrupted"));
-    dispatch("\x04"); await pause(10);
-    // A closing listener must not consume a fresh generation in the same batch.
-    frame(first, prompt(4)); await pause(10);
-    const closingOwner = screen;
-    dispatch("\x04"); frame(first, { type: "invalidate" }, prompt(5));
-    await pause(20);
-    assert.notEqual(screen, closingOwner);
-    assert(screen.render(100).join("\n").includes("Synthetic request 5:"));
-    dispatch("synthetic-prefix");
-    frame(first, { type: "invalidate" }); // Broker lease-expiry event.
-    dispatch("synthetic-suffix"); dispatch("\r");
-    assert.deepEqual(editorInput, []);
-    assert(screen.render(100).join("\n").includes("Input interrupted"));
-    const old = screen; dispatch("\x04"); await pause(10);
-    old.handleInput("synthetic-disposed"); old.handleInput("\r");
-    assert.equal(sent.filter(m => JSON.stringify(m).includes('"type":"input"')).length, 1);
-  } finally {
-    await f.handlers.get("session_shutdown")!(); tui.stop(); TaskRegistry.prototype.start = originalStart;
-    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
-    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
-  }
-});
-
-test("completion messages publish once with follow-up turns for background, detached and local tasks", async () => {
-  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-  const f = fixture();
-  let screen!: import("../src/shell-screen.ts").ShellScreen;
-  let mounts = 0;
-  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { notify() {}, setStatus() {}, custom: (factory: Function) => new Promise(resolve => {
-    screen = factory({ requestRender() {}, terminal: { columns: 100, rows: 40 } }, {}, {}, resolve); mounts++;
-  }) } } as unknown as ExtensionContext;
-  const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
-  const wait = async (condition: () => boolean) => { for (let i = 0; i < 300 && !condition(); i++) await pause(10); assert(condition()); };
-  const approve = () => { screen.render(100); screen.handleInput("y"); };
-  const tool = (command: string, background = false, timeout = 3) => f.tools.get("interactive_shell")!.execute("t", { command, background, timeout }, undefined, undefined, ctx);
-  const taskAction = (id: string, action: string) => f.tools.get("shell_task")!.execute("q", { id, action }, undefined, undefined, ctx);
-  const idOf = (r: Awaited<ReturnType<typeof tool>>) => JSON.parse((r.content[0] as { text: string }).text.split("\n")[0]).id;
-  try {
-    for (const [command, status, code] of [["printf synthetic-output", "completed", 0], ["printf synthetic-failure; exit 7", "failed", 7], ["printf synthetic-timeout; sleep 30", "timeout", null]] as const) {
-      const before = f.messages.length;
-      const run = tool(command, true, 1); approve(); const id = idOf(await run);
-      await wait(() => f.messages.length === before + 1);
-      const { message, options } = f.messages.at(-1)!;
-      assert.equal(message.customType, "shell-completion"); assert.equal(message.display, true); assert.equal(message.details, undefined);
-      assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" });
-      assert(String(message.content).includes(id)); assert(String(message.content).includes(`"status":"${status}"`));
-      assert(String(message.content).includes(`"exitCode":${code}`)); assert(String(message.content).includes("synthetic-"));
-      await taskAction(id, "read"); await taskAction(id, "status"); await taskAction(id, "stop");
-      assert.equal(f.messages.length, before + 1);
-    }
-    let before = f.messages.length;
-    let run = tool("printf synthetic-cancel; sleep 30", true); approve(); const cancelledId = idOf(await run);
-    await pause(100); await taskAction(cancelledId, "stop"); await wait(() => f.messages.length === before + 1);
-    assert(String(f.messages.at(-1)!.message.content).includes('"status":"cancelled"'));
-    before = f.messages.length;
-    const initialMount = mounts;
-    run = tool("printf synthetic-foreground"); approve(); await wait(() => mounts === initialMount + 2);
-    await wait(() => screen.render(100).join("\n").includes("completed"));
-    assert.equal(f.messages.length, before); screen.handleInput("\r");
-    assert(JSON.stringify(await run).includes("synthetic-foreground")); assert.equal(f.messages.length, before);
-    // Detach before completion: tool returns launch status, completion publishes later.
-    run = tool("sleep .2; printf synthetic-detached"); approve(); await pause(20); screen.handleInput("\x04"); await run;
-    await wait(() => f.messages.length === before + 1);
-    for (const name of ["shell", "shell-bg"]) {
-      before = f.messages.length;
-      const local = f.commands.get(name)!.handler("printf synthetic-local; exit 4", ctx); approve();
-      if (name === "shell") {
-        await wait(() => screen.render(100).join("\n").includes("failed"));
-        assert.equal(f.messages.length, before); screen.handleInput("\r");
-      }
-      await local; await wait(() => f.messages.length === before + 1);
-      assert(String(f.messages.at(-1)!.message.content).includes('"exitCode":4'));
-    }
-    // Completion while an auto-open response owns focus is withheld until acknowledgement.
-    before = f.messages.length;
-    run = tool("stty -echo; printf 'Password: '; sleep .5; exit 9", true); approve(); await run;
-    await wait(() => screen.render(100).join("\n").includes("Waiting for your input"));
-    screen.handleInput("synthetic-response");
-    await wait(() => screen.render(100).join("\n").includes("Input interrupted"));
-    await pause(150); assert.equal(f.messages.length, before);
-    screen.handleInput("\x04"); await wait(() => f.messages.length === before + 1);
-    assert(!String(f.messages.at(-1)!.message.content).includes("synthetic-response"));
-    assert(String(f.messages.at(-1)!.message.content).includes('"exitCode":9'));
-    // An unrelated approval also defers delivery; session replacement discards it.
-    before = f.messages.length;
-    run = tool("sleep .1; printf stale-output", true); approve(); await run;
-    const blocked = tool("true"); await pause(300);
-    assert.equal(f.messages.length, before);
-    await f.handlers.get("session_start")!(); await blocked; await pause(50);
-    assert.equal(f.messages.length, before);
-    run = tool("sleep 30", true); approve(); await run;
-    await f.handlers.get("session_shutdown")!(); await pause(50);
-    assert.equal(f.messages.length, before);
-  } finally {
-    await f.handlers.get("session_shutdown")!();
-    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
-    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
-  }
-});
-
-test("installed SDK custom completion API preserves role/display and requests idle or streaming follow-up", async () => {
-  const sdk = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js", import.meta.url).href);
-  const prompts: unknown[] = [], followUps: unknown[] = [], persisted: unknown[] = [];
-  const idle = {
-    isStreaming: false,
-    _isEmittingAgentSettled: false,
-    _runAgentPrompt: async (message: unknown) => { prompts.push(message); persisted.push(message); },
-  };
-  const message = { customType: "shell-completion", content: 'Task synthetic-id failed (exit 7)\nsynthetic-output', display: true, details: undefined };
-  await sdk.AgentSession.prototype.sendCustomMessage.call(idle, message, { triggerTurn: true, deliverAs: "followUp" });
-  assert.equal(prompts.length, 1); assert.equal(persisted.length, 1);
-  assert.equal((prompts[0] as { role: string }).role, "custom");
-  assert.equal((prompts[0] as { display: boolean }).display, true);
-  const streaming = { isStreaming: true, agent: { followUp(message: unknown) { followUps.push(message); }, steer() { assert.fail("completion must not steer"); } } };
-  await sdk.AgentSession.prototype.sendCustomMessage.call(streaming, message, { triggerTurn: true, deliverAs: "followUp" });
-  assert.equal(followUps.length, 1);
-  assert.equal((followUps[0] as { content: string }).content, message.content);
-});
-
-test("terminal broker frame before child close remains foreground-owned; deferred completions drain once", async () => {
-  const { TaskRegistry } = await import("../src/task-registry.ts");
-  type Task = import("../src/task-registry.ts").ShellTask;
-  const originalStart = TaskRegistry.prototype.start;
-  const tasks: Task[] = [];
-  TaskRegistry.prototype.start = function (...args) { const task = originalStart.apply(this, args); if (task) tasks.push(task); return task; };
-  const input = Object.getOwnPropertyDescriptor(process.stdin, "isTTY"), output = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
-  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-  const f = fixture();
-  let screen!: import("../src/shell-screen.ts").ShellScreen;
-  let mounts = 0;
-  const ctx = { mode: "tui", hasUI: true, cwd: "/tmp", ui: { notify() {}, setStatus() {}, custom: (factory: Function) => new Promise(resolve => {
-    screen = factory({ requestRender() {}, terminal: { columns: 100, rows: 40 } }, {}, {}, resolve); mounts++;
-  }) } } as unknown as ExtensionContext;
-  const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
-  const wait = async (condition: () => boolean) => { for (let i = 0; i < 300 && !condition(); i++) await pause(10); assert(condition()); };
-  const approve = () => { screen.render(100); screen.handleInput("y"); };
-  const execute = (command: string, background = false) => f.tools.get("interactive_shell")!.execute("t", { command, background }, undefined, undefined, ctx);
-  try {
-    let returned = false;
-    const foreground = execute("sleep .4").then(result => { returned = true; return result; });
-    approve(); await wait(() => mounts === 2);
-    const task = tasks[0];
-    (task as unknown as { receive(data: string): void }).receive('{"type":"output","text":"synthetic-final"}\n{"type":"done","status":"completed","exitCode":0}\n');
-    assert.equal(task.active, true); assert.equal(task.status, "completed");
-    screen.handleInput("\x04");
-    await pause(30); assert.equal(returned, false); assert.equal(f.messages.length, 0);
-    await task.done;
-    const result = await foreground;
-    assert(JSON.stringify(result).includes('synthetic-final'));
-    assert(JSON.stringify(result).includes('completed'));
-    assert.equal(f.messages.length, 0);
-    // Three finished tasks cannot release a screen or lose their per-task snapshots.
-    for (let n = 0; n < 3; n++) {
-      const background = execute(`sleep .3; printf synthetic-${n}`, true); approve(); await background;
-    }
-    const blocking = execute("true");
-    const heldScreen = screen;
-    await wait(() => tasks.slice(1).every(t => !t.active));
-    assert.equal(screen, heldScreen); assert.equal(f.messages.length, 0);
-    screen.handleInput("\x1b"); await blocking;
-    await wait(() => f.messages.length === 3);
-    for (let n = 0; n < 3; n++) {
-      const matching = f.messages.filter(m => String(m.message.content).includes(tasks[n + 1].id));
-      assert.equal(matching.length, 1);
-      assert(String(matching[0].message.content).includes(`synthetic-${n}`));
-      assert.deepEqual(matching[0].options, { triggerTurn: true, deliverAs: "followUp" });
-    }
-  } finally {
-    await f.handlers.get("session_shutdown")!(); TaskRegistry.prototype.start = originalStart;
-    if (input) Object.defineProperty(process.stdin, "isTTY", input); else Reflect.deleteProperty(process.stdin, "isTTY");
-    if (output) Object.defineProperty(process.stdout, "isTTY", output); else Reflect.deleteProperty(process.stdout, "isTTY");
+    [process.stdin, process.stdout].forEach((stream, index) => {
+      if (descriptors[index]) Object.defineProperty(stream, "isTTY", descriptors[index]!); else Reflect.deleteProperty(stream, "isTTY");
+    });
   }
 });
