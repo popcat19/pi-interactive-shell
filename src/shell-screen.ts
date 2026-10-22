@@ -14,6 +14,7 @@ export class ShellScreen {
   private finished = false;
   private output = "";
   private identity = "Shell";
+  private command = "";
   private prompt = "";
   private outputPage = 0;
   private outputPages = 1;
@@ -26,7 +27,10 @@ export class ShellScreen {
   constructor(actions: ScreenActions, redraw: () => void, currentHeight = () => 24, style: (role: "accent" | "warning", text: string) => string = (_role, text) => text) {
     this.actions = actions; this.redraw = redraw; this.currentHeight = currentHeight; this.style = style;
   }
-  start(id: string) { this.identity = `Task ${id}`; }
+  start(id: string, command = "") {
+    this.identity = `Task ${id}`;
+    this.command = command.replace(/[\x00-\x1f\x7f-\uffff]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  }
   invalidate() {}
   event(event: { type: string; text?: string; id?: number }) {
     if (this.disposed || this.finished) return false;
@@ -70,7 +74,7 @@ export class ShellScreen {
     }
     const limit = Math.max(1, height - 2);
     const wrap = (text: string) => wrapTextWithAnsi(text, w);
-    const header = wrap(this.identity).map(line => this.style("accent", line));
+    const header = [...(this.command ? wrap(`Command: ${this.command}`) : []), ...wrap(this.identity)].map(line => this.style("accent", line));
     const request = this.prompt ? wrap(this.prompt).map(line => this.style("warning", line)) : [];
     const hints = wrap("Type anytime | Esc: stop | Ctrl+]: detach | PgUp/PgDn: output");
     const pageSize = Math.max(1, limit - header.length - request.length - hints.length - 1);

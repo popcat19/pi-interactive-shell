@@ -65,7 +65,7 @@ export default function extension(pi: ExtensionAPI) {
           input: data => task.input(data),
           resize: (columns, rows) => task.resize(columns, rows),
         }, () => tui.requestRender(), () => tui.terminal?.rows ?? 24, (role, text) => theme.fg?.(role, text) ?? text);
-        screen.start(task.id);
+        screen.start(task.id, task.command);
         task.attach(event => {
           if (closing) return;
           if (event.type === "done") screen?.finish(task.status);

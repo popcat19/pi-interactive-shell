@@ -58,7 +58,7 @@ test("interactive lifecycle launches without approval and closes without confirm
       assert.equal(f.tui.onDebug, f.debug);
     }
     const run = f.execute("stty -echo; printf 'Password: '; read -r x; test \"$x\" = synthetic-only");
-    await wait(() => f.screen().render(100).join("\n").includes("Password:"));
+    await wait(() => f.screen().render(100).some(line => line.trim() === "Password:"));
     f.screen().handleInput("synthetic-only"); f.screen().handleInput("\r");
     const result = await run;
     assert(JSON.stringify(result).includes("completed")); assert(!JSON.stringify(result).includes("synthetic-only"));

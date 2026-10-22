@@ -8,6 +8,7 @@ const terminal = new Set(["completed", "failed", "cancelled", "timeout", "error"
 const brokerPath = fileURLToPath(new URL("../broker/pty-broker.py", import.meta.url));
 export class ShellTask {
   readonly id = randomUUID();
+  readonly command: string;
   status = "running";
   exitCode?: number;
   endedAt?: number;
@@ -26,6 +27,7 @@ export class ShellTask {
   private stopping = false;
   private closed = false;
   constructor(command: string, cwd: string, timeout: number, lease: number, onWaiting?: (task: ShellTask, waiting: boolean) => void) {
+    this.command = command;
     this.onWaiting = onWaiting;
     this.done = new Promise(resolve => { this.resolve = resolve; });
     try {

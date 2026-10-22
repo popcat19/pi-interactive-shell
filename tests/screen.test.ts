@@ -38,6 +38,21 @@ test("output strips carriage-return artifacts and retains exact printable text",
   } finally { f.screen.dispose(); }
 });
 
+test("launch command stays visible alongside SSH prompts", () => {
+  const f = fixture();
+  try {
+    f.screen.start("test-task", "ssh -t popcat19-thinkpad1.local 'su -'");
+    f.screen.event({ type: "prompt", id: 1, text: "Password:" });
+    const rendered = f.screen.render(100).join("\n");
+    assert(rendered.includes("Command: ssh -t popcat19-thinkpad1.local 'su -'"));
+    assert(rendered.includes("Password:"));
+    f.screen.start("test-task", "printf '\x1b[2J'\nexit");
+    const safe = f.screen.render(100).join("\n");
+    assert(!safe.includes("\x1b"));
+    assert(safe.includes("\\u001b"));
+  } finally { f.screen.dispose(); }
+});
+
 test("SSH prompt context is shown without gating input", () => {
   const f = fixture();
   try {
