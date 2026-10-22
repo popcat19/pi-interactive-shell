@@ -44,8 +44,8 @@ test("launch command stays visible alongside SSH prompts", () => {
     f.screen.start("test-task", "ssh -t popcat19-thinkpad1.local 'su -'");
     f.screen.event({ type: "prompt", id: 1, text: "Password:" });
     const rendered = f.screen.render(100).join("\n");
-    assert(rendered.includes("Command: ssh -t popcat19-thinkpad1.local 'su -'"));
-    assert(rendered.includes("Password:"));
+    assert(rendered.includes("Running command: ssh -t popcat19-thinkpad1.local 'su -'"));
+    assert(rendered.includes("Input requested by command: Password:"));
     f.screen.start("test-task", "printf '\x1b[2J'\nexit");
     const safe = f.screen.render(100).join("\n");
     assert(!safe.includes("\x1b"));

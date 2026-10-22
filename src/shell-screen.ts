@@ -74,8 +74,8 @@ export class ShellScreen {
     }
     const limit = Math.max(1, height - 2);
     const wrap = (text: string) => wrapTextWithAnsi(text, w);
-    const header = [...(this.command ? wrap(`Command: ${this.command}`) : []), ...wrap(this.identity)].map(line => this.style("accent", line));
-    const request = this.prompt ? wrap(this.prompt).map(line => this.style("warning", line)) : [];
+    const header = [...(this.command ? wrap(`Running command: ${this.command}`) : []), ...wrap(this.identity)].map(line => this.style("accent", line));
+    const request = this.prompt ? wrap(`Input requested by command: ${this.prompt}`).map(line => this.style("warning", line)) : [];
     const hints = wrap("Type anytime | Esc: stop | Ctrl+]: detach | PgUp/PgDn: output");
     const pageSize = Math.max(1, limit - header.length - request.length - hints.length - 1);
     const output = wrap(this.output || "(No output yet)");
